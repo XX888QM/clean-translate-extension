@@ -223,7 +223,8 @@ async function performTranslation(root = document.body) {
         showToast('YX翻译正在优化阅读体验...', 'loading');
     }
 
-    const CHUNK_SIZE = 40;
+    // Increased CHUNK_SIZE for better throughput with new background BATCH_SIZE
+    const CHUNK_SIZE = 60;
     for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
         if (!chrome.runtime?.id) break; // Stop if invalid
 

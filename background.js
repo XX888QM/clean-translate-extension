@@ -1,6 +1,5 @@
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'TRANSLATE_TEXT_BATCH') {
-    // 必须用一个封装函数来捕获所有可能的异步错误
     (async () => {
       try {
         const results = await handleBatchTranslation(request.texts);
@@ -10,31 +9,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: false, error: error.message });
       }
     })();
-    return true; // Keep the channel open for asynchronous response
+    return true;
   }
 });
 
 async function handleBatchTranslation(texts) {
   const results = {};
   const queue = [...texts];
-  const BATCH_SIZE = 12; // Slightly reduced safe batch size
+  // 调整为 18：黄金平衡点
+  // 既能通过并行请求大幅提升速度，又将触发 API 限制的风险降到最低
+  const BATCH_SIZE = 18;
 
   while (queue.length > 0) {
     const batch = queue.splice(0, BATCH_SIZE);
 
-    // Create promises with individual timeout protection
     const promises = batch.map(text =>
       Promise.race([
         translateSingle(text),
-        new Promise(resolve => setTimeout(() => resolve({ original: text, translated: text }), 8000)) // 8s timeout fallback
+        new Promise(resolve => setTimeout(() => resolve({ original: text, translated: text }), 6000))
       ])
     );
 
-    // Wait for all in this batch to finish (or timeout)
     const batchResults = await Promise.all(promises);
 
     batchResults.forEach(res => {
-      // Ensure we have a valid result object even on error
       if (res && res.original) {
         results[res.original] = res.translated || res.original;
       }
@@ -76,8 +74,6 @@ async function translateSingle(text) {
     }
     return { original: text, translated: text };
   } catch (error) {
-    // Fail silently for individual words to keep the batch moving
-    // console.warn("Translation error for:", text, error);
     return { original: text, translated: text };
   }
 }
