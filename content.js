@@ -287,8 +287,16 @@ function checkAutoTranslate() {
     if (!chrome.runtime?.id) return;
 
     try {
-        chrome.storage.local.get(['auto_translate_enabled'], (result) => {
+        chrome.storage.local.get(['auto_translate_enabled', 'excluded_domains'], (result) => {
             if (chrome.runtime.lastError) return;
+
+            // Check if domain is excluded
+            const currentHost = window.location.hostname;
+            const excludedList = result.excluded_domains || [];
+            if (excludedList.includes(currentHost)) {
+                console.log(`Clean Translator: Domain ${currentHost} is ignored by user preference.`);
+                return;
+            }
 
             // Default to TRUE if undefined (user hasn't toggled it yet)
             const isEnabled = result.auto_translate_enabled !== false;

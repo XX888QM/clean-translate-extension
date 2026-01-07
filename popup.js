@@ -29,19 +29,57 @@ document.getElementById('restoreBtn').addEventListener('click', () => {
     sendMessageToTab({ type: 'RESTORE_ORIGINAL' });
 });
 
-// Handle Auto-Translate Toggle
+// Handle Toggles
 const autoToggle = document.getElementById('autoTranslateToggle');
+const excludeToggle = document.getElementById('excludeDomainToggle');
+let currentHostname = '';
 
-// Load saved state
-chrome.storage.local.get(['auto_translate_enabled'], (result) => {
-    // Default to true if undefined
-    autoToggle.checked = result.auto_translate_enabled !== false;
+// Get current tab hostname and load saved state
+chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs.length === 0) return;
+    try {
+        const url = new URL(tabs[0].url);
+        currentHostname = url.hostname;
+
+        chrome.storage.local.get(['auto_translate_enabled', 'excluded_domains'], (result) => {
+            // Default to true if undefined
+            autoToggle.checked = result.auto_translate_enabled !== false;
+
+            // Check if current domain is excluded
+            const excludedList = result.excluded_domains || [];
+            if (excludeToggle) {
+                excludeToggle.checked = excludedList.includes(currentHostname);
+            }
+        });
+    } catch (e) {
+        // Invalid URL (e.g. chrome:// pages)
+        if (excludeToggle) excludeToggle.disabled = true;
+    }
 });
 
-// Save state on change
+// Save global state on change
 autoToggle.addEventListener('change', () => {
     chrome.storage.local.set({ auto_translate_enabled: autoToggle.checked });
 });
+
+// Save domain exclusion state on change
+if (excludeToggle) {
+    excludeToggle.addEventListener('change', () => {
+        if (!currentHostname) return;
+
+        chrome.storage.local.get(['excluded_domains'], (result) => {
+            let list = result.excluded_domains || [];
+            if (excludeToggle.checked) {
+                // Add to blocklist
+                if (!list.includes(currentHostname)) list.push(currentHostname);
+            } else {
+                // Remove from blocklist
+                list = list.filter(domain => domain !== currentHostname);
+            }
+            chrome.storage.local.set({ excluded_domains: list });
+        });
+    });
+}
 
 // Listen for completion message from content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
