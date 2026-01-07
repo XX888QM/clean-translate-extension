@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Clean Translator</title>
+  <style>
+    body {
+      width: 280px;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: #f9f9f9;
+      color: #333;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    h3 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 600;
+      color: #202124;
+    }
+
+    .btn-group {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    button {
+      width: 100%;
+      padding: 10px;
+      cursor: pointer;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      transition: background-color 0.2s, transform 0.1s;
+    }
+
+    .primary-btn {
+      background-color: #1a73e8;
+      color: white;
+    }
+
+    .primary-btn:hover {
+      background-color: #1557b0;
+    }
+
+    .primary-btn:active {
+      transform: scale(0.98);
+    }
+
+    .secondary-btn {
+      background-color: #e8f0fe;
+      color: #1a73e8;
+    }
+
+    .secondary-btn:hover {
+      background-color: #d2e3fc;
+    }
+
+    .secondary-btn:active {
+      transform: scale(0.98);
+    }
+
+    .status {
+      margin-top: 12px;
+      font-size: 12px;
+      color: #5f6368;
+      text-align: center;
+      min-height: 1.2em;
+    }
+
+    .settings {
+      margin-top: 20px;
+      padding-top: 15px;
+      border-top: 1px solid #e0e0e0;
+    }
+
+    .switch-container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: #202124;
+    }
+
+    /* Toggle Switch */
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 36px;
+      height: 20px;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: .4s;
+      border-radius: 34px;
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 2px;
+      bottom: 2px;
+      background-color: white;
+      transition: .4s;
+      border-radius: 50%;
+    }
+
+    input:checked+.slider {
+      background-color: #1a73e8;
+    }
+
+    input:checked+.slider:before {
+      transform: translateX(16px);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="header">
+    <h3>YX纯净网页翻译</h3>
+  </div>
+
+  <div class="btn-group">
+    <button id="translateBtn" class="primary-btn">翻译当前页面</button>
+    <button id="restoreBtn" class="secondary-btn">还原原文</button>
+  </div>
+
+  <div class="status" id="status">准备就绪</div>
+
+  <div class="settings">
+    <div class="switch-container">
+      <span>自动翻译外语网页</span>
+      <label class="switch">
+        <input type="checkbox" id="autoTranslateToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+
+</html>

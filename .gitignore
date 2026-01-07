@@ -1,0 +1,15 @@
+.DS_Store
+*.zip
+*.pem
+*.crx
+node_modules/
+dist/
+build/
+.env
+.vscode/
+.idea/
+tmp/
+# Ignore promotional assets not needed for code repo
+promo_*.png
+screenshot_*.png
+original_logo.png
