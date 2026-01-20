@@ -29,7 +29,7 @@ Visit the Chrome Web Store link (link to be added) and click "Add to Chrome".
 ### Manual Installation (开发版安装)
 1. Clone this repository:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/clean-translate-extension.git
+   git clone https://github.com/XX888QM/clean-translate-extension.git
    ```
 2. Open Chrome and navigate to `chrome://extensions/`.
 3. Enable **Developer mode** (top right corner).
@@ -52,9 +52,19 @@ Visit the Chrome Web Store link (link to be added) and click "Add to Chrome".
 ## 🔐 Privacy (隐私安全)
 
 - **Pure Local Logic**: No user data is sent to private servers.
-- **Minimal Permissions**: Only requests necessary permissions (`activeTab`, `storage`).
+- **Minimal Permissions**: Only requests necessary permissions (`activeTab`, `storage`, `contextMenus`).
 - **Transparency**: Fully open-source.
 - [Read Privacy Policy](PRIVACY_POLICY.md)
+
+## 📝 Changelog (更新日志)
+
+### v1.2.2
+- 添加 API 限流保护和自动重试机制
+- 优化 AI 术语表查询性能（420+ 术语）
+- 新增主流平台术语支持（GitHub, Twitter, Reddit, Discord 等）
+- 修复并发翻译竞态条件
+- 优化缓存策略，容量提升至 10000 条
+- 完善错误处理和用户提示
 
 ## 🤝 Contributing
 
