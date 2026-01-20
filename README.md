@@ -12,8 +12,8 @@
 
 - 🚀 **Crash-Free Translation**: Uses non-invasive text node replacement to safely translate complex web apps (React, Vue, SPA) without breaking the DOM.
   - **零崩溃**：采用无侵入式文本节点替换技术，完美兼容 React/Vue 等复杂单页应用，告别页面报错。
-- ⚡ **High Performance**: Optimized concurrency (batch size 15) and local caching for instant translation.
-  - **极致性能**：优化的高并发请求（15线程）与本地缓存策略，实现秒级即时翻译。
+- ⚡ **High Performance**: Optimized concurrency (batch size 18) and local caching for instant translation.
+  - **极致性能**：优化的高并发请求（18线程）与本地缓存策略，实现秒级即时翻译。
 - 🤖 **AI-Optimized**: Built-in glossary for accurate translation of AI technical terms (e.g., Agent, Transformer, Token).
   - **AI 术语校对**：内置 AI 专业术语库，精确翻译 "Agent", "Transformer" 等专业词汇。
 - 🔄 **Smart Caching**: Automatically caches translated text to verify instant loading on revisiting pages.

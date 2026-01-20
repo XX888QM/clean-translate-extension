@@ -137,6 +137,48 @@
     input:checked+.slider:before {
       transform: translateX(16px);
     }
+
+    .cache-section {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid #e0e0e0;
+    }
+
+    .cache-info {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      color: #202124;
+      margin-bottom: 10px;
+    }
+
+    .cache-size {
+      color: #5f6368;
+      font-size: 12px;
+    }
+
+    .clear-cache-btn {
+      width: 100%;
+      padding: 8px;
+      background-color: #f1f3f4;
+      color: #5f6368;
+      font-size: 12px;
+    }
+
+    .clear-cache-btn:hover {
+      background-color: #e8eaed;
+      color: #202124;
+    }
+
+    .shortcuts-hint {
+      margin-top: 14px;
+      padding-top: 10px;
+      border-top: 1px solid #e0e0e0;
+      font-size: 11px;
+      color: #9aa0a6;
+      text-align: center;
+    }
   </style>
 </head>
 
@@ -167,6 +209,18 @@
         <span class="slider"></span>
       </label>
     </div>
+  </div>
+
+  <div class="cache-section">
+    <div class="cache-info">
+      <span>翻译缓存</span>
+      <span id="cacheSize" class="cache-size">加载中...</span>
+    </div>
+    <button id="clearCacheBtn" class="clear-cache-btn">清除缓存</button>
+  </div>
+
+  <div class="shortcuts-hint">
+    快捷键: Alt+T 翻译 | Alt+R 还原
   </div>
 
   <script src="popup.js"></script>

@@ -30,8 +30,9 @@ To provide translation functionality, text content from the webpages you visit i
 Our extension requires specific permissions to function:
 
 *   **activeTab**: Used only to access the text content of the current tab when you initiate a translation.
-*   **storage**: Used only to save your preference settings (e.g., whether auto-translate is on or off).
+*   **storage**: Used only to save your preference settings (e.g., whether auto-translate is on or off) and translation cache.
 *   **scripting**: Used to inject the translation code into the webpage to replace text.
+*   **contextMenus**: Used to add "Translate Selection" and "Translate Page" options to the right-click context menu.
 
 ### 4. Changes to This Policy
 
@@ -69,8 +70,9 @@ YX 纯净网页翻译（以下简称“我们”）致力于保护您的隐私�
 我们的扩展程序需要特定权限才能运行：
 
 *   **activeTab**：仅用于在您启动翻译时访问当前标签页的文本内容。
-*   **storage**：仅用于保存您的偏好设置（例如自动翻译是否开启）。
+*   **storage**：仅用于保存您的偏好设置（例如自动翻译是否开启）和翻译缓存。
 *   **scripting**：用于将翻译代码注入网页以替换文本。
+*   **contextMenus**：用于在右键菜单中添加"翻译选中文本"和"翻译整个页面"选项。
 
 ### 4. 政策变更
 
