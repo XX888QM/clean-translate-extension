@@ -10,16 +10,27 @@
 
 ## ✨ Features (功能亮点)
 
-- 🚀 **Crash-Free Translation**: Uses non-invasive text node replacement to safely translate complex web apps (React, Vue, SPA) without breaking the DOM.
-  - **零崩溃**：采用无侵入式文本节点替换技术，完美兼容 React/Vue 等复杂单页应用，告别页面报错。
-- ⚡ **High Performance**: Optimized concurrency (batch size 18) and local caching for instant translation.
-  - **极致性能**：优化的高并发请求（18线程）与本地缓存策略，实现秒级即时翻译。
-- 🤖 **AI-Optimized**: Built-in glossary for accurate translation of AI technical terms (e.g., Agent, Transformer, Token).
-  - **AI 术语校对**：内置 AI 专业术语库，精确翻译 "Agent", "Transformer" 等专业词汇。
-- 🔄 **Smart Caching**: Automatically caches translated text to verify instant loading on revisiting pages.
-  - **智能缓存**：自动缓存已翻译内容，再次访问同一页面时实现 0 延迟加载。
-- 🎨 **Visual Feedback**: Elegant toast notifications for translation status.
-  - **优雅交互**：极简的 Toast 提示，实时反馈翻译进度与状态。
+- 🚀 **Crash-Free Translation / 零崩溃翻译**
+  Uses non-invasive text node replacement to safely translate complex web apps (React, Vue, SPA) without breaking the DOM.
+  采用 `TreeWalker` 逐节点替换 `nodeValue`，不触碰 `innerHTML`，完美兼容 React / Vue / 任意 SPA 框架。
+
+- 🌐 **9 Translation Engines / 9 大翻译引擎**
+  Google Free（默认，免配置）、Google Cloud、DeepL（自动识别 Free / Pro）、百度、OpenAI、Anthropic Claude、DeepSeek、MiniMax、智谱 GLM。失败自动回退到 Google Free。
+
+- ⚡ **Smart Caching / 智能缓存**
+  内存 LRU + IndexedDB 双层缓存；30 天未访问自动过期，总量超过 50 MB 自动按访问时间淘汰，永远不会撑爆磁盘。
+
+- 🎯 **Per-Site Preferences / 网站偏好**
+  支持「自动翻译全部 / 仅白名单 / 全部手动」三种模式，单个域名可单独设为「自动」或「从不」。
+
+- 🤖 **AI Glossary / AI 术语校对**
+  内置 420+ AI/ML 专有术语词表，翻译为中文时自动校正常见错译（如 "Agent" → 智能体、"Token" → Token），支持用户自定义术语。
+
+- 🪟 **Selection Comparison / 划词多引擎对比**
+  右键选中文本可同时获得当前引擎和 Google Free 的翻译，对比择优。
+
+- 🔒 **Privacy-First / 隐私优先**
+  无自建服务器；API 密钥仅存 `chrome.storage.local`，不上云；`<input>` / `<textarea>` / contenteditable 元素绝不进入翻译请求。
 
 ## 🛠 Installation (安装指南)
 
@@ -33,43 +44,84 @@ Visit the Chrome Web Store link (link to be added) and click "Add to Chrome".
    ```
 2. Open Chrome and navigate to `chrome://extensions/`.
 3. Enable **Developer mode** (top right corner).
-4. Click **Load unpacked**.
-5. Select the directory where you cloned this repository.
+4. Click **Load unpacked** and select the directory.
+5. （可选）在扩展弹窗里选择翻译引擎并填入对应的 API Key。
+
+## ⌨️ Shortcuts (快捷键)
+
+| 操作 | 默认 |
+|---|---|
+| 翻译当前页面 | `Alt + T` |
+| 还原原文 | `Alt + R` |
 
 ## 📦 Project Structure
 
 ```
 .
-├── manifest.json       # Config: Permissions, version, icons
-├── background.js       # Core: Handles API requests, concurrency, and glossaries
-├── content.js          # Logic: DOM traversal, text replacement, and UI injection
-├── popup.html          # UI: The extension popup interface
-├── popup.js            # UI Logic: Settings and toggle interactions
-├── icons/              # Assets: App icons
-└── PRIVACY_POLICY.md   # Legal: Bilingual privacy policy
+├── manifest.json       # Manifest V3 配置（permissions / commands / icons）
+├── background.js       # Service Worker：9 引擎路由、IDB 缓存、缓存淘汰、术语校对
+├── content.js          # Content Script：DOM 遍历、内存缓存、UI 交互
+├── popup.html / .js    # 弹窗 UI：引擎切换、API Key、翻译模式、网站偏好
+├── icons/              # 应用图标
+├── tests/run-tests.js  # 纯函数单测（Node.js 跑）
+├── CLAUDE.md           # Claude Code 用项目说明
+├── AGENTS.md           # Codex CLI 用项目说明（与 CLAUDE.md 同步）
+└── PRIVACY_POLICY.md   # 双语隐私政策
 ```
 
-## 🔐 Privacy (隐私安全)
+## 🔐 Permissions (权限说明)
 
-- **Pure Local Logic**: No user data is sent to private servers.
-- **Minimal Permissions**: Only requests necessary permissions (`activeTab`, `storage`, `contextMenus`).
-- **Transparency**: Fully open-source.
-- [Read Privacy Policy](PRIVACY_POLICY.md)
+| 权限 | 用途 |
+|---|---|
+| `activeTab` | 当前 Tab 内容访问 |
+| `storage` | 保存设置、API Key、翻译缓存 |
+| `contextMenus` | "翻译选中文本" / "翻译整个页面" 右键菜单 |
+| `alarms` | 每日定时清理 IndexedDB 缓存中过期条目 |
+| `<all_urls>` content script | 翻译脚本注入到任意网页（不主动翻译时不读取数据） |
 
-## 📝 Changelog (更新日志)
+详见 [Privacy Policy](PRIVACY_POLICY.md)。
+
+## 🧪 Development
+
+```bash
+# 跑测试（仅覆盖纯函数）
+node tests/run-tests.js
+
+# 加载扩展：chrome://extensions/ → 开发者模式 → 加载未打包 → 选择本目录
+# 修改源码后：在该扩展卡片上点击刷新按钮
+```
+
+更多开发细节（架构、消息协议、安全机制）见 [CLAUDE.md](CLAUDE.md)。
+
+## 📝 Changelog
+
+### v1.5.1 (current)
+- fetch 全链路 AbortController + 15s 超时取消，杜绝请求悬空
+- IDB 缓存升级 schema v2：`lastAccess` 字段 + 30 天过期 + 50 MB 上限
+- 缓存清理改用 `chrome.alarms`（daily + 写后一次性 alarm），SW 休眠也可靠
+- `SAVE/GET_ENGINE_CONFIG` 严格限定扩展页调用，content script 无法读写 API Key
+- `translatedAttrRefs` 加 WeakSet 去重 + 失效引用清理，SPA 长跑无内存泄漏
+- 子树翻译复用内存缓存，不再每次 dump 全量 IDB
+- Google Cloud / DeepL / 百度的术语校对改并行 (`Promise.all`)
+- `target_lang` / `engine` 强制白名单校验，API 错误响应不再透传细节
+- 自定义术语按内容签名删除，连点不再删错
+- 隐私政策补齐 9 引擎说明 + storage.sync 透明声明
+- manifest 补 `author` / `homepage_url` / `minimum_chrome_version`
+
+### v1.5.0
+- 翻译核心与 UI 大幅重构，新增 9 引擎（含 OpenAI / Claude / DeepL / 百度等）
+- 引入 IndexedDB 持久缓存与内存 LRU 双层缓存
+- 翻译模式（auto_all / whitelist / manual）与网站偏好
 
 ### v1.2.2
-- 添加 API 限流保护和自动重试机制
-- 优化 AI 术语表查询性能（420+ 术语）
-- 新增主流平台术语支持（GitHub, Twitter, Reddit, Discord 等）
-- 修复并发翻译竞态条件
-- 优化缓存策略，容量提升至 10000 条
-- 完善错误处理和用户提示
+- 限流保护与自动重试
+- AI 术语表扩充至 420+
+- 修复并发翻译竞态
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions welcome. PRs should keep `node tests/run-tests.js` green and follow the conventions in `CLAUDE.md`.
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
