@@ -1,3 +1,101 @@
+// ===== IndexedDB 翻译缓存 =====
+const IDB_NAME = 'yx-translate-cache';
+const IDB_VERSION = 1;
+const IDB_STORE = 'translations';
+
+function openCacheDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(IDB_NAME, IDB_VERSION);
+        request.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(IDB_STORE)) {
+                db.createObjectStore(IDB_STORE);
+            }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function cacheGetAll() {
+    const db = await openCacheDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const store = tx.objectStore(IDB_STORE);
+        const results = {};
+        const cursorReq = store.openCursor();
+        cursorReq.onsuccess = (e) => {
+            const cursor = e.target.result;
+            if (cursor) {
+                results[cursor.key] = cursor.value;
+                cursor.continue();
+            } else {
+                resolve(results);
+            }
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+    });
+}
+
+async function cachePutBatch(entries) {
+    if (!entries || Object.keys(entries).length === 0) return;
+    const db = await openCacheDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        for (const [key, value] of Object.entries(entries)) {
+            store.put(value, key);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
+async function cacheClearAll() {
+    const db = await openCacheDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
+async function cacheCount() {
+    const db = await openCacheDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.count();
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+// ===== Service Worker 生命周期保护 =====
+let activeTranslations = 0;
+let keepAliveInterval = null;
+
+function startKeepAlive() {
+    if (keepAliveInterval) return;
+    keepAliveInterval = setInterval(() => {
+        if (activeTranslations > 0) {
+            // 轻量级 API 调用保持 Service Worker 活跃
+            chrome.runtime.getPlatformInfo(() => {});
+        } else {
+            stopKeepAlive();
+        }
+    }, 25000);
+}
+
+function stopKeepAlive() {
+    if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+    }
+}
+
 // 消息监听（统一处理所有消息类型）
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'TRANSLATE_TEXT_BATCH') {
@@ -7,6 +105,84 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: true, results });
       } catch (error) {
         console.error("批量翻译失败:", error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true;
+  }
+
+  // IndexedDB 缓存消息
+  if (request.type === 'CACHE_GET_ALL') {
+    cacheGetAll()
+      .then(results => sendResponse({ success: true, results }))
+      .catch(e => sendResponse({ success: false, error: e.message }));
+    return true;
+  }
+
+  if (request.type === 'CACHE_PUT_BATCH') {
+    cachePutBatch(request.entries)
+      .then(() => sendResponse({ success: true }))
+      .catch(e => sendResponse({ success: false, error: e.message }));
+    return true;
+  }
+
+  if (request.type === 'CACHE_CLEAR') {
+    cacheClearAll()
+      .then(() => sendResponse({ success: true }))
+      .catch(e => sendResponse({ success: false, error: e.message }));
+    return true;
+  }
+
+  if (request.type === 'CACHE_COUNT') {
+    cacheCount()
+      .then(count => sendResponse({ success: true, count }))
+      .catch(e => sendResponse({ success: false, error: e.message }));
+    return true;
+  }
+
+  // 划词翻译引擎对比
+  if (request.type === 'TRANSLATE_COMPARE') {
+    (async () => {
+      try {
+        const text = request.text;
+        const settings = await chrome.storage.local.get(['target_lang', 'translate_engine', 'api_keys']);
+        const targetLang = settings.target_lang || 'zh-CN';
+        const engine = settings.translate_engine || 'google_free';
+        const apiKeys = settings.api_keys || {};
+
+        const ENGINE_NAMES = {
+          google_free: 'Google翻译(免费)', google_cloud: 'Google Cloud',
+          deepl: 'DeepL', baidu: '百度翻译', openai: 'OpenAI GPT',
+          claude: 'Claude', deepseek: 'DeepSeek', minimax: 'MiniMax', glm: '智谱GLM'
+        };
+
+        const results = {};
+
+        if (engine === 'google_free') {
+          // 当前引擎是 google_free，只返回一个结果
+          const r = await translateBulk([text], targetLang);
+          results.primary = { engine: ENGINE_NAMES.google_free, text: r[text] || text };
+        } else {
+          // 并行调用：当前引擎 + google_free
+          const [primaryResult, googleResult] = await Promise.allSettled([
+            translateByEngine([text], targetLang, engine, apiKeys),
+            translateBulk([text], targetLang)
+          ]);
+
+          results.primary = {
+            engine: ENGINE_NAMES[engine] || engine,
+            text: primaryResult.status === 'fulfilled' ? (primaryResult.value[text] || text) : text,
+            error: primaryResult.status === 'rejected' ? primaryResult.reason.message : null
+          };
+          results.secondary = {
+            engine: ENGINE_NAMES.google_free,
+            text: googleResult.status === 'fulfilled' ? (googleResult.value[text] || text) : text,
+            error: googleResult.status === 'rejected' ? googleResult.reason.message : null
+          };
+        }
+
+        sendResponse({ success: true, results });
+      } catch (error) {
         sendResponse({ success: false, error: error.message });
       }
     })();
@@ -23,7 +199,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === 'CLEAR_CACHE') {
-    chrome.storage.local.remove(['translation_cache'], () => {
+    chrome.storage.local.remove(['translation_cache', 'cache_lang'], () => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  // 获取引擎配置
+  if (request.type === 'GET_ENGINE_CONFIG') {
+    chrome.storage.local.get(['translate_engine', 'api_keys'], (result) => {
+      sendResponse({
+        engine: result.translate_engine || 'google_free',
+        apiKeys: result.api_keys || {}
+      });
+    });
+    return true;
+  }
+
+  // 保存引擎配置
+  if (request.type === 'SAVE_ENGINE_CONFIG') {
+    const data = {};
+    if (request.engine) data.translate_engine = request.engine;
+    if (request.apiKeys) data.api_keys = request.apiKeys;
+    chrome.storage.local.set(data, () => {
       sendResponse({ success: true });
     });
     return true;
@@ -58,7 +256,43 @@ chrome.commands.onCommand.addListener(async (command) => {
 });
 
 // 右键菜单
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async (details) => {
+  // 从旧版 chrome.storage.local 迁移缓存到 IndexedDB
+  if (details.reason === 'update') {
+    try {
+      const data = await chrome.storage.local.get(['translation_cache']);
+      if (data.translation_cache && Object.keys(data.translation_cache).length > 0) {
+        await cachePutBatch(data.translation_cache);
+        chrome.storage.local.remove(['translation_cache', 'cache_lang']);
+        console.log('YX翻译: 缓存已迁移到 IndexedDB');
+      }
+    } catch (e) {
+      console.warn('YX翻译: 缓存迁移失败', e);
+    }
+
+    // 迁移旧版设置到新版翻译模式
+    try {
+      const settings = await chrome.storage.local.get(['auto_translate_enabled', 'excluded_domains', 'translate_mode']);
+      if (!settings.translate_mode && settings.auto_translate_enabled === false) {
+        chrome.storage.local.set({ translate_mode: 'manual' });
+      }
+      // 迁移 excluded_domains 到 site_preferences
+      if (settings.excluded_domains && settings.excluded_domains.length > 0) {
+        const existingPrefs = (await chrome.storage.local.get(['site_preferences'])).site_preferences || {};
+        const newPrefs = { ...existingPrefs };
+        for (const domain of settings.excluded_domains) {
+          if (!newPrefs[domain]) {
+            newPrefs[domain] = 'never';
+          }
+        }
+        chrome.storage.local.set({ site_preferences: newPrefs });
+        console.log('YX翻译: 域名排除列表已迁移到网站偏好');
+      }
+    } catch (e) {
+      console.warn('YX翻译: 设置迁移失败', e);
+    }
+  }
+
   // 创建右键菜单：翻译选中文本
   chrome.contextMenus.create({
     id: 'translate-selection',
@@ -92,30 +326,624 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 async function handleBatchTranslation(texts) {
+  activeTranslations++;
+  startKeepAlive();
+  try {
+    return await _handleBatchTranslation(texts);
+  } finally {
+    activeTranslations--;
+    if (activeTranslations <= 0) {
+      activeTranslations = 0;
+      setTimeout(() => {
+        if (activeTranslations <= 0) stopKeepAlive();
+      }, 5000);
+    }
+  }
+}
+
+async function _handleBatchTranslation(texts) {
+  // 一次性读取目标语言和引擎设置
+  let targetLang = 'zh-CN';
+  let engine = 'google_free';
+  let apiKeys = {};
+  try {
+    const settings = await chrome.storage.local.get(['target_lang', 'translate_engine', 'api_keys']);
+    if (settings.target_lang) targetLang = settings.target_lang;
+    if (settings.translate_engine) engine = settings.translate_engine;
+    if (settings.api_keys) apiKeys = settings.api_keys;
+  } catch (e) { /* 使用默认值 */ }
+
+  // 将文本按字符总量分组，每组合并为一次 API 请求
+  const MAX_BULK_CHARS = 1500; // 单次请求最大原文字符数
+  const bulkGroups = [];
+  let currentGroup = [];
+  let currentLen = 0;
+
+  for (const text of texts) {
+    if (currentLen + text.length > MAX_BULK_CHARS && currentGroup.length > 0) {
+      bulkGroups.push(currentGroup);
+      currentGroup = [];
+      currentLen = 0;
+    }
+    currentGroup.push(text);
+    currentLen += text.length + 1; // +1 for \n separator
+  }
+  if (currentGroup.length > 0) bulkGroups.push(currentGroup);
+
+  // 并行发送合并请求（最多 8 个并发）
   const results = {};
-  const queue = [...texts];
-  // 调整为 18：黄金平衡点
-  // 既能通过并行请求大幅提升速度，又将触发 API 限制的风险降到最低
-  const BATCH_SIZE = 18;
+  const PARALLEL = 8;
 
-  while (queue.length > 0) {
-    const batch = queue.splice(0, BATCH_SIZE);
-
-    const promises = batch.map(text =>
+  for (let i = 0; i < bulkGroups.length; i += PARALLEL) {
+    const batch = bulkGroups.slice(i, i + PARALLEL);
+    const promises = batch.map(group =>
       Promise.race([
-        translateSingle(text),
-        new Promise(resolve => setTimeout(() => resolve({ original: text, translated: text }), 6000))
+        translateByEngine(group, targetLang, engine, apiKeys),
+        new Promise(resolve => {
+          setTimeout(() => {
+            const fallback = {};
+            group.forEach(t => fallback[t] = t);
+            resolve(fallback);
+          }, 15000); // LLM引擎需要更长超时
+        })
       ])
     );
-
     const batchResults = await Promise.all(promises);
-
-    batchResults.forEach(res => {
-      if (res && res.original) {
-        results[res.original] = res.translated || res.original;
-      }
-    });
+    batchResults.forEach(r => Object.assign(results, r));
   }
+  return results;
+}
+
+// 根据引擎选择路由到不同翻译函数
+async function translateByEngine(texts, targetLang, engine, apiKeys) {
+  try {
+    switch (engine) {
+      case 'google_cloud':
+        return await translateGoogleCloud(texts, targetLang, apiKeys.google_cloud);
+      case 'deepl':
+        return await translateDeepL(texts, targetLang, apiKeys.deepl);
+      case 'baidu':
+        return await translateBaidu(texts, targetLang, apiKeys.baidu_appid, apiKeys.baidu_key);
+      case 'openai':
+      case 'claude':
+      case 'deepseek':
+      case 'minimax':
+      case 'glm':
+        return await translateWithLLM(texts, targetLang, engine, apiKeys[engine]);
+      case 'google_free':
+      default:
+        return await translateBulk(texts, targetLang);
+    }
+  } catch (e) {
+    console.warn(`YX翻译: ${engine} 引擎翻译失败，回退到免费Google翻译`, e.message);
+    // 非google_free引擎失败时回退到免费Google翻译
+    if (engine !== 'google_free') {
+      return await translateBulk(texts, targetLang);
+    }
+    // google_free本身失败，返回原文
+    const fallback = {};
+    texts.forEach(t => fallback[t] = t);
+    return fallback;
+  }
+}
+
+// 多条文本合并为一次 API 请求（用 \n 分隔）
+async function translateBulk(texts, targetLang) {
+  // 单条文本走原有逻辑
+  if (texts.length === 1) {
+    const r = await translateSingle(texts[0], 0, targetLang);
+    return { [r.original]: r.translated };
+  }
+
+  try {
+    const joined = texts.join('\n');
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(joined)}`;
+    const response = await fetch(url);
+
+    if (response.status === 429) {
+      // 限流时回退到逐条翻译（带重试）
+      return await translateBulkFallback(texts, targetLang);
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const data = await response.json();
+
+    // 拼接完整译文
+    let fullTranslation = '';
+    if (data && Array.isArray(data[0])) {
+      fullTranslation = data[0]
+        .filter(s => s && s[0])
+        .map(s => s[0])
+        .join('');
+    }
+
+    // 按 \n 拆分回各条译文
+    const translated = fullTranslation.split('\n');
+
+    // 行数匹配：直接映射
+    if (translated.length === texts.length) {
+      const results = {};
+      for (let i = 0; i < texts.length; i++) {
+        let t = translated[i];
+        if (targetLang.startsWith('zh')) {
+          t = await refineTranslation(texts[i], t);
+        }
+        results[texts[i]] = t || texts[i];
+      }
+      return results;
+    }
+
+    // 行数不匹配：回退逐条翻译
+    console.warn(`YX翻译: 合并翻译行数不匹配 (期望 ${texts.length}, 得到 ${translated.length})，回退逐条翻译`);
+    return await translateBulkFallback(texts, targetLang);
+  } catch (e) {
+    console.warn('YX翻译: 合并翻译失败，回退逐条翻译', e.message);
+    return await translateBulkFallback(texts, targetLang);
+  }
+}
+
+// 合并翻译失败时的逐条回退
+async function translateBulkFallback(texts, targetLang) {
+  const results = {};
+  const promises = texts.map(text =>
+    translateSingle(text, 0, targetLang)
+      .catch(() => ({ original: text, translated: text }))
+  );
+  const individual = await Promise.all(promises);
+  individual.forEach(r => {
+    results[r.original] = r.translated;
+  });
+  return results;
+}
+
+// ========== Google Cloud Translation API v2 ==========
+async function translateGoogleCloud(texts, targetLang, apiKey) {
+  if (!apiKey) throw new Error('Google Cloud API密钥未配置');
+
+  const results = {};
+  // Google Cloud API 支持批量翻译，直接发送数组
+  const url = `https://translation.googleapis.com/language/translate/v2?key=${encodeURIComponent(apiKey)}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      q: texts,
+      target: targetLang, // Google Cloud API 支持 'zh-CN'、'zh-TW' 等完整语言代码
+      format: 'text'
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Google Cloud API 错误 ${response.status}: ${err}`);
+  }
+
+  const data = await response.json();
+  const translations = data.data?.translations || [];
+
+  for (let i = 0; i < texts.length; i++) {
+    let translated = translations[i]?.translatedText || texts[i];
+    // 术语校对
+    if (targetLang.startsWith('zh')) {
+      translated = await refineTranslation(texts[i], translated);
+    }
+    results[texts[i]] = translated;
+  }
+  return results;
+}
+
+// ========== DeepL API ==========
+async function translateDeepL(texts, targetLang, apiKey) {
+  if (!apiKey) throw new Error('DeepL API密钥未配置');
+
+  // 判断是 Free 还是 Pro API（Free 密钥以 ':fx' 结尾）
+  const isFree = apiKey.endsWith(':fx');
+  const baseUrl = isFree
+    ? 'https://api-free.deepl.com/v2/translate'
+    : 'https://api.deepl.com/v2/translate';
+
+  // DeepL 目标语言映射
+  const deeplLangMap = {
+    'zh-CN': 'ZH-HANS', 'zh-TW': 'ZH-HANT', 'zh': 'ZH-HANS',
+    'en': 'EN-US', 'pt': 'PT-BR', 'pt-BR': 'PT-BR', 'pt-PT': 'PT-PT'
+  };
+  const deeplTarget = deeplLangMap[targetLang] || targetLang.toUpperCase();
+
+  // DeepL 支持批量文本（通过多个 text 参数）
+  const params = new URLSearchParams();
+  texts.forEach(t => params.append('text', t));
+  params.append('target_lang', deeplTarget);
+
+  const response = await fetch(baseUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': `DeepL-Auth-Key ${apiKey}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: params.toString()
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`DeepL API 错误 ${response.status}: ${err}`);
+  }
+
+  const data = await response.json();
+  const results = {};
+  const translations = data.translations || [];
+
+  for (let i = 0; i < texts.length; i++) {
+    let translated = translations[i]?.text || texts[i];
+    if (targetLang.startsWith('zh')) {
+      translated = await refineTranslation(texts[i], translated);
+    }
+    results[texts[i]] = translated;
+  }
+  return results;
+}
+
+// ========== 百度翻译 API ==========
+
+// 纯JS实现的MD5函数（Service Worker不支持crypto.subtle.digest同步生成MD5）
+function md5(string) {
+  function md5cycle(x, k) {
+    let a = x[0], b = x[1], c = x[2], d = x[3];
+    a = ff(a, b, c, d, k[0], 7, -680876936);
+    d = ff(d, a, b, c, k[1], 12, -389564586);
+    c = ff(c, d, a, b, k[2], 17, 606105819);
+    b = ff(b, c, d, a, k[3], 22, -1044525330);
+    a = ff(a, b, c, d, k[4], 7, -176418897);
+    d = ff(d, a, b, c, k[5], 12, 1200080426);
+    c = ff(c, d, a, b, k[6], 17, -1473231341);
+    b = ff(b, c, d, a, k[7], 22, -45705983);
+    a = ff(a, b, c, d, k[8], 7, 1770035416);
+    d = ff(d, a, b, c, k[9], 12, -1958414417);
+    c = ff(c, d, a, b, k[10], 17, -42063);
+    b = ff(b, c, d, a, k[11], 22, -1990404162);
+    a = ff(a, b, c, d, k[12], 7, 1804603682);
+    d = ff(d, a, b, c, k[13], 12, -40341101);
+    c = ff(c, d, a, b, k[14], 17, -1502002290);
+    b = ff(b, c, d, a, k[15], 22, 1236535329);
+    a = gg(a, b, c, d, k[1], 5, -165796510);
+    d = gg(d, a, b, c, k[6], 9, -1069501632);
+    c = gg(c, d, a, b, k[11], 14, 643717713);
+    b = gg(b, c, d, a, k[0], 20, -373897302);
+    a = gg(a, b, c, d, k[5], 5, -701558691);
+    d = gg(d, a, b, c, k[10], 9, 38016083);
+    c = gg(c, d, a, b, k[15], 14, -660478335);
+    b = gg(b, c, d, a, k[4], 20, -405537848);
+    a = gg(a, b, c, d, k[9], 5, 568446438);
+    d = gg(d, a, b, c, k[14], 9, -1019803690);
+    c = gg(c, d, a, b, k[3], 14, -187363961);
+    b = gg(b, c, d, a, k[8], 20, 1163531501);
+    a = gg(a, b, c, d, k[13], 5, -1444681467);
+    d = gg(d, a, b, c, k[2], 9, -51403784);
+    c = gg(c, d, a, b, k[7], 14, 1735328473);
+    b = gg(b, c, d, a, k[12], 20, -1926607734);
+    a = hh(a, b, c, d, k[5], 4, -378558);
+    d = hh(d, a, b, c, k[8], 11, -2022574463);
+    c = hh(c, d, a, b, k[11], 16, 1839030562);
+    b = hh(b, c, d, a, k[14], 23, -35309556);
+    a = hh(a, b, c, d, k[1], 4, -1530992060);
+    d = hh(d, a, b, c, k[4], 11, 1272893353);
+    c = hh(c, d, a, b, k[7], 16, -155497632);
+    b = hh(b, c, d, a, k[10], 23, -1094730640);
+    a = hh(a, b, c, d, k[13], 4, 681279174);
+    d = hh(d, a, b, c, k[0], 11, -358537222);
+    c = hh(c, d, a, b, k[3], 16, -722521979);
+    b = hh(b, c, d, a, k[6], 23, 76029189);
+    a = hh(a, b, c, d, k[9], 4, -640364487);
+    d = hh(d, a, b, c, k[12], 11, -421815835);
+    c = hh(c, d, a, b, k[15], 16, 530742520);
+    b = hh(b, c, d, a, k[2], 23, -995338651);
+    a = ii(a, b, c, d, k[0], 6, -198630844);
+    d = ii(d, a, b, c, k[7], 10, 1126891415);
+    c = ii(c, d, a, b, k[14], 15, -1416354905);
+    b = ii(b, c, d, a, k[5], 21, -57434055);
+    a = ii(a, b, c, d, k[12], 6, 1700485571);
+    d = ii(d, a, b, c, k[3], 10, -1894986606);
+    c = ii(c, d, a, b, k[10], 15, -1051523);
+    b = ii(b, c, d, a, k[1], 21, -2054922799);
+    a = ii(a, b, c, d, k[8], 6, 1873313359);
+    d = ii(d, a, b, c, k[15], 10, -30611744);
+    c = ii(c, d, a, b, k[6], 15, -1560198380);
+    b = ii(b, c, d, a, k[13], 21, 1309151649);
+    a = ii(a, b, c, d, k[4], 6, -145523070);
+    d = ii(d, a, b, c, k[11], 10, -1120210379);
+    c = ii(c, d, a, b, k[2], 15, 718787259);
+    b = ii(b, c, d, a, k[9], 21, -343485551);
+    x[0] = add32(a, x[0]);
+    x[1] = add32(b, x[1]);
+    x[2] = add32(c, x[2]);
+    x[3] = add32(d, x[3]);
+  }
+
+  function cmn(q, a, b, x, s, t) {
+    a = add32(add32(a, q), add32(x, t));
+    return add32((a << s) | (a >>> (32 - s)), b);
+  }
+  function ff(a, b, c, d, x, s, t) { return cmn((b & c) | ((~b) & d), a, b, x, s, t); }
+  function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & (~d)), a, b, x, s, t); }
+  function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
+  function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | (~d)), a, b, x, s, t); }
+
+  function md5blk(s) {
+    const md5blks = [];
+    for (let i = 0; i < 64; i += 4) {
+      md5blks[i >> 2] = s.charCodeAt(i) + (s.charCodeAt(i + 1) << 8) +
+        (s.charCodeAt(i + 2) << 16) + (s.charCodeAt(i + 3) << 24);
+    }
+    return md5blks;
+  }
+
+  function md5blk_array(a) {
+    const md5blks = [];
+    for (let i = 0; i < 64; i += 4) {
+      md5blks[i >> 2] = a[i] + (a[i + 1] << 8) + (a[i + 2] << 16) + (a[i + 3] << 24);
+    }
+    return md5blks;
+  }
+
+  function add32(a, b) {
+    return (a + b) & 0xFFFFFFFF;
+  }
+
+  function rhex(n) {
+    const hex_chr = '0123456789abcdef';
+    let s = '';
+    for (let j = 0; j < 4; j++) {
+      s += hex_chr.charAt((n >> (j * 8 + 4)) & 0x0F) + hex_chr.charAt((n >> (j * 8)) & 0x0F);
+    }
+    return s;
+  }
+
+  function hex(x) {
+    return x.map(rhex).join('');
+  }
+
+  // 将UTF-8字符串转为字节数组
+  function toUTF8Array(str) {
+    const utf8 = [];
+    for (let i = 0; i < str.length; i++) {
+      let charcode = str.charCodeAt(i);
+      if (charcode < 0x80) utf8.push(charcode);
+      else if (charcode < 0x800) {
+        utf8.push(0xc0 | (charcode >> 6), 0x80 | (charcode & 0x3f));
+      } else if (charcode < 0xd800 || charcode >= 0xe000) {
+        utf8.push(0xe0 | (charcode >> 12), 0x80 | ((charcode >> 6) & 0x3f), 0x80 | (charcode & 0x3f));
+      } else {
+        i++;
+        charcode = 0x10000 + (((charcode & 0x3ff) << 10) | (str.charCodeAt(i) & 0x3ff));
+        utf8.push(0xf0 | (charcode >> 18), 0x80 | ((charcode >> 12) & 0x3f),
+          0x80 | ((charcode >> 6) & 0x3f), 0x80 | (charcode & 0x3f));
+      }
+    }
+    return utf8;
+  }
+
+  const bytes = toUTF8Array(string);
+  const n = bytes.length;
+  let state = [1732584193, -271733879, -1732584194, 271733878];
+  let i;
+
+  // 处理完整的64字节块
+  for (i = 64; i <= n; i += 64) {
+    const block = bytes.slice(i - 64, i);
+    md5cycle(state, md5blk_array(block));
+  }
+
+  // 填充剩余字节
+  const tail = bytes.slice(i - 64);
+  const padded = new Array(64).fill(0);
+  for (let j = 0; j < tail.length; j++) padded[j] = tail[j];
+  padded[tail.length] = 0x80;
+
+  if (tail.length > 55) {
+    md5cycle(state, md5blk_array(padded));
+    padded.fill(0);
+  }
+
+  // 添加长度（位数，小端序）
+  const bitLen = n * 8;
+  padded[56] = bitLen & 0xFF;
+  padded[57] = (bitLen >> 8) & 0xFF;
+  padded[58] = (bitLen >> 16) & 0xFF;
+  padded[59] = (bitLen >> 24) & 0xFF;
+  // 对于超过 2^32 位的消息需要高32位，但翻译文本不会那么长
+  md5cycle(state, md5blk_array(padded));
+
+  return hex(state);
+}
+
+async function translateBaidu(texts, targetLang, appId, key) {
+  if (!appId || !key) throw new Error('百度翻译AppID或密钥未配置');
+
+  // 百度翻译目标语言映射
+  const baiduLangMap = {
+    'zh-CN': 'zh', 'zh-TW': 'cht', 'zh': 'zh',
+    'en': 'en', 'ja': 'jp', 'ko': 'kor',
+    'fr': 'fra', 'de': 'de', 'ru': 'ru',
+    'es': 'spa', 'pt': 'pt', 'it': 'it',
+    'ar': 'ara', 'th': 'th', 'vi': 'vie'
+  };
+  const to = baiduLangMap[targetLang] || targetLang;
+
+  // 百度 API 支持用 \n 分隔的多条文本
+  const query = texts.join('\n');
+  const salt = Date.now().toString();
+  const sign = md5(appId + query + salt + key);
+
+  const params = new URLSearchParams({
+    q: query, from: 'auto', to, appid: appId, salt, sign
+  });
+
+  const response = await fetch('https://fanyi-api.baidu.com/api/trans/vip/translate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  });
+
+  if (!response.ok) throw new Error(`百度翻译 HTTP ${response.status}`);
+
+  const data = await response.json();
+  if (data.error_code) throw new Error(`百度翻译错误 ${data.error_code}: ${data.error_msg}`);
+
+  const results = {};
+  const transResult = data.trans_result || [];
+
+  // 百度翻译返回 src/dst 对，按 \n 分隔的文本会返回多条结果
+  if (transResult.length === texts.length) {
+    for (let i = 0; i < texts.length; i++) {
+      let translated = transResult[i]?.dst || texts[i];
+      if (targetLang.startsWith('zh')) {
+        translated = await refineTranslation(texts[i], translated);
+      }
+      results[texts[i]] = translated;
+    }
+  } else {
+    // 行数不匹配时尝试按原文匹配
+    const dstMap = new Map();
+    transResult.forEach(r => dstMap.set(r.src, r.dst));
+    for (const text of texts) {
+      let translated = dstMap.get(text) || text;
+      if (targetLang.startsWith('zh') && translated !== text) {
+        translated = await refineTranslation(text, translated);
+      }
+      results[text] = translated;
+    }
+  }
+  return results;
+}
+
+// ========== LLM 统一翻译接口（OpenAI / Claude / DeepSeek） ==========
+async function translateWithLLM(texts, targetLang, engine, apiKey) {
+  if (!apiKey) throw new Error(`${engine} API密钥未配置`);
+
+  // 目标语言名称映射（用于提示词）
+  const langNames = {
+    'zh-CN': '简体中文', 'zh-TW': '繁体中文', 'zh': '中文',
+    'en': '英文', 'ja': '日文', 'ko': '韩文',
+    'fr': '法文', 'de': '德文', 'ru': '俄文',
+    'es': '西班牙文', 'pt': '葡萄牙文', 'it': '意大利文'
+  };
+  const langName = langNames[targetLang] || targetLang;
+
+  // 将多条文本用编号列表格式发送，减少API调用次数
+  const numberedTexts = texts.map((t, i) => `[${i + 1}] ${t}`).join('\n');
+
+  const systemPrompt = `你是专业翻译。将以下编号文本逐条翻译为${langName}，保持原文格式。每行输出格式：[编号] 译文。只输出翻译结果，不要解释。`;
+  const userMessage = numberedTexts;
+
+  // 各引擎配置
+  const engineConfig = {
+    openai: {
+      url: 'https://api.openai.com/v1/chat/completions',
+      model: 'gpt-4o-mini',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      buildBody: (sys, user) => JSON.stringify({
+        model: 'gpt-4o-mini', messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: user }
+        ], temperature: 0.1
+      })
+    },
+    claude: {
+      url: 'https://api.anthropic.com/v1/messages',
+      model: 'claude-sonnet-4-20250514',
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json'
+      },
+      buildBody: (sys, user) => JSON.stringify({
+        model: 'claude-sonnet-4-20250514', max_tokens: 4096,
+        system: sys,
+        messages: [{ role: 'user', content: user }],
+        temperature: 0.1
+      })
+    },
+    deepseek: {
+      url: 'https://api.deepseek.com/v1/chat/completions',
+      model: 'deepseek-chat',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      buildBody: (sys, user) => JSON.stringify({
+        model: 'deepseek-chat', messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: user }
+        ], temperature: 0.1
+      })
+    },
+    minimax: {
+      url: 'https://api.minimax.chat/v1/text/chatcompletion_v2',
+      model: 'MiniMax-M2.5',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      buildBody: (sys, user) => JSON.stringify({
+        model: 'MiniMax-M2.5', messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: user }
+        ], temperature: 0.1
+      })
+    },
+    glm: {
+      url: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+      model: 'glm-5',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      buildBody: (sys, user) => JSON.stringify({
+        model: 'glm-5', messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: user }
+        ], temperature: 0.1
+      })
+    }
+  };
+
+  const config = engineConfig[engine];
+  if (!config) throw new Error(`不支持的LLM引擎: ${engine}`);
+
+  const response = await fetch(config.url, {
+    method: 'POST',
+    headers: config.headers,
+    body: config.buildBody(systemPrompt, userMessage)
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`${engine} API 错误 ${response.status}: ${err}`);
+  }
+
+  const data = await response.json();
+
+  // 提取回复内容（Claude 和 OpenAI/DeepSeek 的响应格式不同）
+  let replyText = '';
+  if (engine === 'claude') {
+    replyText = data.content?.[0]?.text || '';
+  } else {
+    replyText = data.choices?.[0]?.message?.content || '';
+  }
+
+  // 解析编号格式的翻译结果
+  const results = {};
+  const lines = replyText.split('\n').filter(l => l.trim());
+
+  for (const line of lines) {
+    // 匹配 [数字] 译文 格式
+    const match = line.match(/^\[(\d+)\]\s*(.+)$/);
+    if (match) {
+      const idx = parseInt(match[1]) - 1;
+      if (idx >= 0 && idx < texts.length) {
+        results[texts[idx]] = match[2].trim();
+      }
+    }
+  }
+
+  // 未匹配到的文本保留原文
+  for (const text of texts) {
+    if (!results[text]) {
+      results[text] = text;
+    }
+  }
+
+  // LLM翻译不需要术语校对（大模型翻译质量足够好）
   return results;
 }
 
@@ -526,7 +1354,7 @@ const AI_GLOSSARY = {
   "safety": [["安全", "安全性"]],
   "guardrails": [["护栏", "安全护栏"]],
   "content filter": [["内容过滤器", "内容过滤"]],
-  "moderation": [["审核", "内容审核"]],
+  "moderation": [["审核", "内容审核"], ["审核", "版务管理"]],
   "fairness": [["公平", "公平性"]],
   "interpretability": [["可解释性", "可解释性"]],
   "explainability": [["可解释性", "可解释性"]],
@@ -664,8 +1492,6 @@ const AI_GLOSSARY = {
   "kanban": [["看板", "看板"]],
   "assignee": [["受让人", "指派人"]],
   "assignees": [["受让人", "指派人"]],
-  "label": [["标签", "标签"]],
-  "labels": [["标签", "标签"]],
   "discussion": [["讨论", "讨论"]],
   "discussions": [["讨论", "讨论区"]],
   "wiki": [["维基", "Wiki文档"]],
@@ -673,7 +1499,6 @@ const AI_GLOSSARY = {
   "sponsors": [["赞助商", "赞助者"]],
   "sponsoring": [["赞助", "赞助"]],
   "dependabot": [["依赖机器人", "Dependabot"]],
-  "copilot": [["副驾驶", "Copilot"]],
   "codespace": [["代码空间", "Codespace"]],
   "codespaces": [["代码空间", "Codespaces"]],
 
@@ -684,8 +1509,8 @@ const AI_GLOSSARY = {
   "retweets": [["转推", "转推"]],
   "retweeted": [["转推", "已转推"]],
   "quote tweet": [["引用推文", "引用推文"]],
-  "thread": [["线程", "推文串"], ["主题", "帖子串"]],
-  "threads": [["线程", "推文串"]],
+  "thread": [["线程", "推文串"], ["主题", "帖子串"], ["线程", "子区"]],
+  "threads": [["线程", "推文串"], ["线程", "子区"]],
   "hashtag": [["标签", "话题标签"]],
   "hashtags": [["标签", "话题标签"]],
   "trending": [["趋势", "热门趋势"]],
@@ -723,8 +1548,8 @@ const AI_GLOSSARY = {
   "report": [["报告", "举报"]],
   "x premium": [["X高级版", "X Premium"]],
   "twitter blue": [["推特蓝", "Twitter Blue"]],
-  "space": [["空间", "语音空间"]],
-  "spaces": [["空间", "语音空间"]],
+  "space": [["空间", "语音空间"], ["空间", "Space应用"]],
+  "spaces": [["空间", "语音空间"], ["空间", "Spaces"]],
   "fleet": [["舰队", "限时动态"]],
   "fleets": [["舰队", "限时动态"]],
   "moment": [["时刻", "精选时刻"]],
@@ -762,7 +1587,6 @@ const AI_GLOSSARY = {
   "mods": [["模组", "版主"]],
   "moderator": [["主持人", "版主"]],
   "moderators": [["主持人", "版主"]],
-  "moderation": [["审核", "版务管理"]],
   "ama": [["AMA", "AMA问我任何事"]],
   "ask me anything": [["问我任何事", "AMA"]],
   "iama": [["我是一个", "IAMA"]],
@@ -850,8 +1674,6 @@ const AI_GLOSSARY = {
   "afk": [["离开", "挂机"]],
   "afk channel": [["离开频道", "挂机频道"]],
   "slowmode": [["慢速模式", "慢速模式"]],
-  "thread": [["线程", "子区"]],
-  "threads": [["线程", "子区"]],
   "stage": [["阶段", "舞台"]],
   "stages": [["阶段", "舞台"]],
   "activity": [["活动", "活动状态"]],
@@ -880,8 +1702,6 @@ const AI_GLOSSARY = {
   "captions": [["标题", "文案"]],
   "filter": [["过滤器", "滤镜"]],
   "filters": [["过滤器", "滤镜"]],
-  "sticker": [["贴纸", "贴纸"]],
-  "stickers": [["贴纸", "贴纸"]],
   "live": [["直播", "直播"]],
   "go live": [["开始直播", "开播"]],
   "going live": [["正在直播", "正在直播"]],
@@ -914,7 +1734,6 @@ const AI_GLOSSARY = {
   "messenger": [["信使", "Messenger"]],
   "instagram direct": [["Instagram直接", "Instagram私信"]],
   "reach": [["到达", "触达量"]],
-  "impressions": [["印象", "曝光量"]],
   "engagement rate": [["参与率", "互动率"]],
   "influencer": [["影响者", "网红"]],
   "influencers": [["影响者", "网红"]],
@@ -934,8 +1753,6 @@ const AI_GLOSSARY = {
   "model card": [["模型卡", "模型卡片"]],
   "model cards": [["模型卡", "模型卡片"]],
   "dataset card": [["数据集卡", "数据集卡片"]],
-  "space": [["空间", "Space应用"]],
-  "spaces": [["空间", "Spaces"]],
   "huggingface spaces": [["拥抱脸空间", "Hugging Face Spaces"]],
   "gradio": [["格拉迪奥", "Gradio"]],
   "streamlit": [["流线型", "Streamlit"]],
@@ -957,7 +1774,6 @@ const AI_GLOSSARY = {
   "datasets library": [["数据集库", "Datasets库"]],
   "tokenizers library": [["分词器库", "Tokenizers库"]],
   "evaluate": [["评估", "Evaluate"]],
-  "leaderboard": [["排行榜", "排行榜"]],
   "open llm leaderboard": [["开放LLM排行榜", "Open LLM排行榜"]],
   "trending models": [["趋势模型", "热门模型"]],
   "trending datasets": [["趋势数据集", "热门数据集"]],
@@ -1001,15 +1817,34 @@ const AI_GLOSSARY = {
   "archived": [["存档", "已存档"]]
 };
 
+// 备选翻译源：MyMemory API
+async function translateFallback(text, targetLang = 'zh-CN') {
+  try {
+    // MyMemory 使用 'source|target' 格式的语言对，auto 表示自动检测源语言
+    const langPair = `auto|${targetLang}`;
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langPair)}`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`MyMemory HTTP ${response.status}`);
+    const data = await response.json();
+    if (data && data.responseData && data.responseData.translatedText) {
+      return data.responseData.translatedText;
+    }
+    return null;
+  } catch (e) {
+    console.warn('YX翻译: MyMemory 备选翻译失败', e.message);
+    return null;
+  }
+}
+
 // 翻译单条文本（带重试和退避机制）
-async function translateSingle(text, retryCount = 0) {
+async function translateSingle(text, retryCount = 0, targetLang = 'zh-CN') {
   if (!text || !text.trim()) return { original: text, translated: text };
 
   const MAX_RETRIES = 2;
   const RETRY_DELAY = 1000; // 基础延迟 1 秒
 
   try {
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`;
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
     const response = await fetch(url);
 
     // 处理 429 限流错误
@@ -1017,7 +1852,7 @@ async function translateSingle(text, retryCount = 0) {
       const delay = RETRY_DELAY * Math.pow(2, retryCount); // 指数退避
       console.warn(`YX翻译: API 限流，${delay}ms 后重试...`);
       await new Promise(resolve => setTimeout(resolve, delay));
-      return translateSingle(text, retryCount + 1);
+      return translateSingle(text, retryCount + 1, targetLang);
     }
 
     if (!response.ok) {
@@ -1034,13 +1869,25 @@ async function translateSingle(text, retryCount = 0) {
         .join('');
 
       if (translatedText) {
-        translatedText = refineTranslation(text, translatedText);
+        // 仅中文目标语言时执行术语校对
+        if (targetLang.startsWith('zh')) {
+          translatedText = await refineTranslation(text, translatedText);
+        }
         return { original: text, translated: translatedText };
       }
     }
     return { original: text, translated: text };
   } catch (error) {
-    console.warn(`YX翻译: 翻译失败 - ${error.message}`);
+    console.warn(`YX翻译: Google 翻译失败 - ${error.message}，尝试备选翻译源...`);
+    // Google 翻译失败时尝试 MyMemory
+    const fallbackResult = await translateFallback(text, targetLang);
+    if (fallbackResult) {
+      let result = fallbackResult;
+      if (targetLang.startsWith('zh')) {
+        result = await refineTranslation(text, result);
+      }
+      return { original: text, translated: result };
+    }
     return { original: text, translated: text };
   }
 }
@@ -1048,7 +1895,7 @@ async function translateSingle(text, retryCount = 0) {
 // 预编译术语替换表（只在首次调用时构建）
 let compiledGlossary = null;
 
-function buildCompiledGlossary() {
+async function buildCompiledGlossary() {
   if (compiledGlossary) return compiledGlossary;
 
   // 构建：关键词 -> 替换规则映射
@@ -1056,10 +1903,38 @@ function buildCompiledGlossary() {
   // 构建：错误译文 -> 正确译文 的直接映射（用于快速替换）
   const directReplacements = new Map();
 
+  // 先加载用户自定义术语（优先级更高）
+  let userGlossary = [];
+  try {
+    const data = await chrome.storage.sync.get(['user_glossary']);
+    userGlossary = data.user_glossary || [];
+  } catch (e) { /* 忽略错误 */ }
+
+  // 将用户术语转为内置格式并合并（用户术语优先）
+  for (const item of userGlossary) {
+    if (item.keyword && item.badWord && item.goodWord) {
+      const key = item.keyword.toLowerCase();
+      if (!keywordMap.has(key)) {
+        keywordMap.set(key, []);
+      }
+      // 插入到数组前端，确保用户术语优先
+      keywordMap.get(key).unshift([item.badWord, item.goodWord]);
+      if (!directReplacements.has(item.badWord)) {
+        directReplacements.set(item.badWord, []);
+      }
+      directReplacements.get(item.badWord).unshift({ keyword: key, good: item.goodWord });
+    }
+  }
+
+  // 加载内置术语
   for (const [keyword, replacements] of Object.entries(AI_GLOSSARY)) {
-    keywordMap.set(keyword, replacements);
+    if (!keywordMap.has(keyword)) {
+      keywordMap.set(keyword, replacements);
+    } else {
+      // 用户已有同关键词，追加内置规则到后面
+      keywordMap.get(keyword).push(...replacements);
+    }
     for (const [bad, good] of replacements) {
-      // 记录所有可能的错误译文
       if (!directReplacements.has(bad)) {
         directReplacements.set(bad, []);
       }
@@ -1075,10 +1950,17 @@ function buildCompiledGlossary() {
   return compiledGlossary;
 }
 
-function refineTranslation(source, target) {
+// 监听用户术语变更，重置编译缓存
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === 'sync' && changes.user_glossary) {
+    compiledGlossary = null;
+  }
+});
+
+async function refineTranslation(source, target) {
   if (!target) return source;
 
-  const { keywordMap, sortedBadWords } = buildCompiledGlossary();
+  const { keywordMap, sortedBadWords, directReplacements } = await buildCompiledGlossary();
   const lowerSource = source.toLowerCase();
 
   // 找出原文中包含的关键词
@@ -1097,7 +1979,7 @@ function refineTranslation(source, target) {
   for (const badWord of sortedBadWords) {
     if (!result.includes(badWord)) continue;
 
-    const replacementInfo = buildCompiledGlossary().directReplacements.get(badWord);
+    const replacementInfo = directReplacements.get(badWord);
     for (const { keyword, good } of replacementInfo) {
       if (matchedKeywords.has(keyword)) {
         result = result.split(badWord).join(good);

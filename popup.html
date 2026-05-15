@@ -6,7 +6,7 @@
   <title>Clean Translator</title>
   <style>
     body {
-      width: 280px;
+      width: 300px;
       padding: 16px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background-color: #f9f9f9;
@@ -78,8 +78,33 @@
       min-height: 1.2em;
     }
 
+    /* 语言选择 */
+    .lang-section {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #e0e0e0;
+    }
+
+    .lang-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: #202124;
+    }
+
+    .lang-select {
+      padding: 4px 8px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      font-size: 12px;
+      background: #fff;
+      color: #202124;
+      cursor: pointer;
+    }
+
     .settings {
-      margin-top: 20px;
+      margin-top: 14px;
       padding-top: 15px;
       border-top: 1px solid #e0e0e0;
     }
@@ -138,8 +163,30 @@
       transform: translateX(16px);
     }
 
+    /* 翻译统计 */
+    .stats-section {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #e0e0e0;
+    }
+
+    .stats-title {
+      font-size: 13px;
+      color: #202124;
+      margin-bottom: 6px;
+    }
+
+    .stats-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #5f6368;
+      line-height: 1.8;
+    }
+
+    /* 缓存区域 */
     .cache-section {
-      margin-top: 16px;
+      margin-top: 14px;
       padding-top: 12px;
       border-top: 1px solid #e0e0e0;
     }
@@ -158,17 +205,189 @@
       font-size: 12px;
     }
 
-    .clear-cache-btn {
-      width: 100%;
+    .cache-btn-group {
+      display: flex;
+      gap: 6px;
+    }
+
+    .clear-cache-btn,
+    .cache-action-btn {
+      flex: 1;
       padding: 8px;
       background-color: #f1f3f4;
       color: #5f6368;
       font-size: 12px;
     }
 
-    .clear-cache-btn:hover {
+    .clear-cache-btn:hover,
+    .cache-action-btn:hover {
       background-color: #e8eaed;
       color: #202124;
+    }
+
+    #importCacheFile {
+      display: none;
+    }
+
+    /* 术语管理 */
+    .glossary-section {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #e0e0e0;
+    }
+
+    .glossary-toggle {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      color: #202124;
+      cursor: pointer;
+    }
+
+    .glossary-toggle .arrow {
+      font-size: 10px;
+      transition: transform 0.2s;
+    }
+
+    .glossary-toggle .arrow.open {
+      transform: rotate(90deg);
+    }
+
+    .glossary-panel {
+      display: none;
+      margin-top: 10px;
+    }
+
+    .glossary-panel.show {
+      display: block;
+    }
+
+    .glossary-hint {
+      font-size: 11px;
+      color: #9aa0a6;
+      margin-bottom: 8px;
+      line-height: 1.5;
+    }
+
+    .glossary-input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+
+    .glossary-input-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .glossary-input-label {
+      font-size: 11px;
+      color: #5f6368;
+      white-space: nowrap;
+      width: 50px;
+      text-align: right;
+    }
+
+    .glossary-input-row input {
+      flex: 1;
+      padding: 6px 8px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      font-size: 12px;
+      min-width: 0;
+    }
+
+    .glossary-add-btn {
+      width: 100%;
+      padding: 7px 10px;
+      font-size: 12px;
+      background-color: #1a73e8;
+      color: white;
+      border-radius: 4px;
+    }
+
+    .glossary-list {
+      max-height: 120px;
+      overflow-y: auto;
+      font-size: 11px;
+      color: #5f6368;
+    }
+
+    .glossary-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 3px 0;
+      border-bottom: 1px solid #f1f3f4;
+    }
+
+    .glossary-item .del-btn {
+      cursor: pointer;
+      color: #d93025;
+      font-size: 12px;
+      padding: 0 4px;
+      background: none;
+      border: none;
+      width: auto;
+    }
+
+    /* 网站偏好 */
+    .site-pref-row {
+      padding: 8px 0;
+    }
+
+    .site-pref-info {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      color: #202124;
+      margin-bottom: 6px;
+    }
+
+    .site-pref-status {
+      font-size: 12px;
+      color: #5f6368;
+      padding: 2px 8px;
+      background: #f1f3f4;
+      border-radius: 10px;
+    }
+
+    .site-pref-status.auto {
+      color: #188038;
+      background: #e6f4ea;
+    }
+
+    .site-pref-status.never {
+      color: #d93025;
+      background: #fce8e6;
+    }
+
+    .site-pref-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    .site-pref-btn {
+      flex: 1;
+      padding: 5px 8px;
+      font-size: 11px;
+      background: #f1f3f4;
+      color: #5f6368;
+      border-radius: 4px;
+    }
+
+    .site-pref-btn:hover {
+      background: #e8eaed;
+      color: #202124;
+    }
+
+    .site-pref-btn.active {
+      background: #1a73e8;
+      color: white;
     }
 
     .shortcuts-hint {
@@ -178,6 +397,245 @@
       font-size: 11px;
       color: #9aa0a6;
       text-align: center;
+    }
+
+    /* 翻译引擎配置 */
+    .engine-section {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #e0e0e0;
+    }
+
+    .engine-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: #202124;
+    }
+
+    .api-key-panel {
+      margin-top: 8px;
+    }
+
+    .api-key-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      margin-top: 6px;
+    }
+
+    .api-key-label {
+      font-size: 11px;
+      color: #5f6368;
+      white-space: nowrap;
+      width: 50px;
+      text-align: right;
+    }
+
+    .api-key-input {
+      flex: 1;
+      padding: 6px 8px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      font-size: 12px;
+      min-width: 0;
+    }
+
+    .api-key-save-btn {
+      padding: 6px 12px;
+      background: #1a73e8;
+      color: white;
+      border-radius: 4px;
+      font-size: 12px;
+      white-space: nowrap;
+      width: auto;
+    }
+
+    .api-key-save-btn:hover {
+      background-color: #1557b0;
+    }
+
+    .api-key-hint {
+      font-size: 11px;
+      color: #9aa0a6;
+      margin-top: 6px;
+    }
+
+    /* 功能 10：深色模式 */
+    @media (prefers-color-scheme: dark) {
+      body {
+        background-color: #292a2d;
+        color: #e8eaed;
+      }
+
+      h3 {
+        color: #e8eaed;
+      }
+
+      .primary-btn {
+        background-color: #8ab4f8;
+        color: #202124;
+      }
+
+      .primary-btn:hover {
+        background-color: #aecbfa;
+      }
+
+      .secondary-btn {
+        background-color: #3c4043;
+        color: #8ab4f8;
+      }
+
+      .secondary-btn:hover {
+        background-color: #4a4d51;
+      }
+
+      .status {
+        color: #9aa0a6;
+      }
+
+      .switch-container,
+      .lang-row,
+      .engine-row,
+      .cache-info,
+      .stats-title,
+      .glossary-toggle {
+        color: #e8eaed;
+      }
+
+      .lang-select {
+        background-color: #3c4043;
+        color: #e8eaed;
+        border-color: #5f6368;
+      }
+
+      .slider {
+        background-color: #5f6368;
+      }
+
+      input:checked+.slider {
+        background-color: #8ab4f8;
+      }
+
+      .cache-size,
+      .stats-row {
+        color: #9aa0a6;
+      }
+
+      .clear-cache-btn,
+      .cache-action-btn {
+        background-color: #3c4043;
+        color: #9aa0a6;
+      }
+
+      .clear-cache-btn:hover,
+      .cache-action-btn:hover {
+        background-color: #4a4d51;
+        color: #e8eaed;
+      }
+
+      .settings,
+      .cache-section,
+      .stats-section,
+      .lang-section,
+      .engine-section,
+      .glossary-section,
+      .shortcuts-hint {
+        border-top-color: #3c4043;
+      }
+
+      .api-key-input {
+        background-color: #3c4043;
+        color: #e8eaed;
+        border-color: #5f6368;
+      }
+
+      .api-key-label {
+        color: #9aa0a6;
+      }
+
+      .api-key-save-btn {
+        background-color: #8ab4f8;
+        color: #202124;
+      }
+
+      .api-key-save-btn:hover {
+        background-color: #aecbfa;
+      }
+
+      .api-key-hint {
+        color: #5f6368;
+      }
+
+      .glossary-input-row input {
+        background-color: #3c4043;
+        color: #e8eaed;
+        border-color: #5f6368;
+      }
+
+      .glossary-item {
+        border-bottom-color: #3c4043;
+      }
+
+      .glossary-list {
+        color: #9aa0a6;
+      }
+
+      .glossary-hint {
+        color: #5f6368;
+      }
+
+      .glossary-input-label {
+        color: #9aa0a6;
+      }
+
+      .glossary-add-btn {
+        background-color: #8ab4f8;
+        color: #202124;
+      }
+
+      .shortcuts-hint {
+        color: #5f6368;
+      }
+
+      .site-pref-info {
+        color: #e8eaed;
+      }
+
+      .site-pref-status {
+        color: #9aa0a6;
+        background: #3c4043;
+      }
+
+      .site-pref-status.auto {
+        color: #81c995;
+        background: #1e3a2f;
+      }
+
+      .site-pref-status.never {
+        color: #f28b82;
+        background: #3c2020;
+      }
+
+      .site-pref-btn {
+        background: #3c4043;
+        color: #9aa0a6;
+      }
+
+      .site-pref-btn:hover {
+        background: #4a4d51;
+        color: #e8eaed;
+      }
+
+      .site-pref-btn.active {
+        background: #8ab4f8;
+        color: #202124;
+      }
+
+      .site-pref-label {
+        color: #e8eaed;
+      }
     }
   </style>
 </head>
@@ -194,29 +652,130 @@
 
   <div class="status" id="status">准备就绪</div>
 
+  <!-- 目标语言选择 -->
+  <div class="lang-section">
+    <div class="lang-row">
+      <span>目标语言</span>
+      <select id="targetLangSelect" class="lang-select">
+        <option value="zh-CN">简体中文</option>
+        <option value="zh-TW">繁体中文</option>
+        <option value="en">English</option>
+        <option value="ja">日本語</option>
+        <option value="ko">한국어</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- 翻译引擎配置 -->
+  <div class="engine-section">
+    <div class="engine-row">
+      <span>翻译引擎</span>
+      <select id="engineSelect" class="lang-select">
+        <option value="google_free">Google翻译(免费)</option>
+        <option value="google_cloud">Google Cloud</option>
+        <option value="deepl">DeepL</option>
+        <option value="baidu">百度翻译</option>
+        <option value="openai">OpenAI (GPT)</option>
+        <option value="claude">Claude</option>
+        <option value="deepseek">DeepSeek</option>
+        <option value="minimax">MiniMax</option>
+        <option value="glm">智谱GLM</option>
+      </select>
+    </div>
+    <!-- API Key 配置面板（选择非免费引擎时显示） -->
+    <div id="apiKeyPanel" class="api-key-panel" style="display:none;">
+      <div class="api-key-row" id="apiKeyRow">
+        <span class="api-key-label">API Key</span>
+        <input type="password" id="apiKeyInput" class="api-key-input" placeholder="输入API Key">
+        <button id="apiKeySaveBtn" class="api-key-save-btn">保存</button>
+      </div>
+      <!-- 百度翻译额外需要 APP ID -->
+      <div class="api-key-row" id="baiduAppIdRow" style="display:none;">
+        <span class="api-key-label">APP ID</span>
+        <input type="text" id="baiduAppIdInput" class="api-key-input" placeholder="百度翻译APP ID">
+      </div>
+      <div class="api-key-hint" id="apiKeyHint"></div>
+    </div>
+  </div>
+
   <div class="settings">
-    <div class="switch-container">
-      <span>自动翻译外语网页</span>
-      <label class="switch">
-        <input type="checkbox" id="autoTranslateToggle">
-        <span class="slider"></span>
-      </label>
+    <!-- 翻译模式选择 -->
+    <div class="lang-row">
+      <span>翻译模式</span>
+      <select id="translateModeSelect" class="lang-select">
+        <option value="auto_all">自动翻译所有外语</option>
+        <option value="whitelist">仅翻译白名单网站</option>
+        <option value="manual">全部手动</option>
+      </select>
+    </div>
+    <!-- 当前网站偏好 -->
+    <div class="site-pref-row" style="margin-top: 10px;">
+      <div class="site-pref-info">
+        <span class="site-pref-label">当前网站</span>
+        <span id="sitePreferenceStatus" class="site-pref-status">跟随全局</span>
+      </div>
+      <div class="site-pref-actions">
+        <button id="sitePrefAutoBtn" class="site-pref-btn" title="始终自动翻译此网站">自动</button>
+        <button id="sitePrefNeverBtn" class="site-pref-btn" title="永远不翻译此网站">从不</button>
+        <button id="sitePrefClearBtn" class="site-pref-btn" title="清除偏好，跟随全局设置">清除</button>
+      </div>
     </div>
     <div class="switch-container" style="margin-top: 12px;">
-      <span>永远不翻译此网站</span>
+      <span>双语对照模式</span>
       <label class="switch">
-        <input type="checkbox" id="excludeDomainToggle">
+        <input type="checkbox" id="bilingualToggle">
         <span class="slider"></span>
       </label>
     </div>
   </div>
 
+  <!-- 翻译统计 -->
+  <div class="stats-section">
+    <div class="stats-title">翻译统计</div>
+    <div class="stats-row"><span>已翻译</span><span id="statTotal">0 条</span></div>
+    <div class="stats-row"><span>缓存命中</span><span id="statCache">0 次</span></div>
+    <div class="stats-row"><span>API 调用</span><span id="statApi">0 次</span></div>
+  </div>
+
+  <!-- 缓存管理 -->
   <div class="cache-section">
     <div class="cache-info">
       <span>翻译缓存</span>
       <span id="cacheSize" class="cache-size">加载中...</span>
     </div>
-    <button id="clearCacheBtn" class="clear-cache-btn">清除缓存</button>
+    <div class="cache-btn-group">
+      <button id="clearCacheBtn" class="clear-cache-btn">清除</button>
+      <button id="exportCacheBtn" class="cache-action-btn">导出</button>
+      <button id="importCacheBtnTrigger" class="cache-action-btn">导入</button>
+    </div>
+    <input type="file" id="importCacheFile" accept=".json">
+  </div>
+
+  <!-- 用户术语管理 -->
+  <div class="glossary-section">
+    <div class="glossary-toggle" id="glossaryToggle">
+      <span>自定义术语表</span>
+      <span class="arrow" id="glossaryArrow">&#9654;</span>
+    </div>
+    <div class="glossary-panel" id="glossaryPanel">
+      <div class="glossary-hint">当原文含「触发词」且译文出现「错误译文」时，自动替换为「正确译文」<br>例: agent / 代理 → 智能体</div>
+      <div class="glossary-input-group">
+        <div class="glossary-input-row">
+          <span class="glossary-input-label">触发词</span>
+          <input type="text" id="glossaryKeyword" placeholder="如 agent">
+        </div>
+        <div class="glossary-input-row">
+          <span class="glossary-input-label">错误译文</span>
+          <input type="text" id="glossaryBad" placeholder="如 代理">
+        </div>
+        <div class="glossary-input-row">
+          <span class="glossary-input-label">正确译文</span>
+          <input type="text" id="glossaryGood" placeholder="如 智能体">
+        </div>
+        <button class="glossary-add-btn" id="glossaryAddBtn">添加</button>
+      </div>
+      <div class="glossary-list" id="glossaryList"></div>
+    </div>
   </div>
 
   <div class="shortcuts-hint">
