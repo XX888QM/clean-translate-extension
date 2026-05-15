@@ -1,7 +1,14 @@
 // ===== IndexedDB 翻译缓存 =====
+// schema v2: value 为 { v: 译文字符串, t: 最近访问时间戳 ms }
+// 兼容 v1: 旧 value 为纯字符串，读取时自动解包
 const IDB_NAME = 'yx-translate-cache';
-const IDB_VERSION = 1;
+const IDB_VERSION = 2;
 const IDB_STORE = 'translations';
+
+// 缓存淘汰参数
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 天未访问就清掉
+const CACHE_MAX_BYTES = 50 * 1024 * 1024;      // 硬上限 50MB
+const CACHE_CLEANUP_ALARM = 'yx-cache-cleanup';
 
 function openCacheDB() {
     return new Promise((resolve, reject) => {
@@ -11,10 +18,19 @@ function openCacheDB() {
             if (!db.objectStoreNames.contains(IDB_STORE)) {
                 db.createObjectStore(IDB_STORE);
             }
+            // v1 → v2 没有结构变化，只是 value 格式由 string 变 {v,t}；读时兼容即可
         };
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
     });
+}
+
+// 把存储 value 解包成纯译文字符串（兼容 v1 旧数据）
+function unwrapCacheValue(raw) {
+    if (raw == null) return null;
+    if (typeof raw === 'string') return raw;
+    if (typeof raw === 'object' && typeof raw.v === 'string') return raw.v;
+    return null;
 }
 
 async function cacheGetAll() {
@@ -27,7 +43,8 @@ async function cacheGetAll() {
         cursorReq.onsuccess = (e) => {
             const cursor = e.target.result;
             if (cursor) {
-                results[cursor.key] = cursor.value;
+                const v = unwrapCacheValue(cursor.value);
+                if (v !== null) results[cursor.key] = v;
                 cursor.continue();
             } else {
                 resolve(results);
@@ -40,11 +57,44 @@ async function cacheGetAll() {
 async function cachePutBatch(entries) {
     if (!entries || Object.keys(entries).length === 0) return;
     const db = await openCacheDB();
+    const now = Date.now();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(IDB_STORE, 'readwrite');
         const store = tx.objectStore(IDB_STORE);
         for (const [key, value] of Object.entries(entries)) {
-            store.put(value, key);
+            // 写时同时记录 lastAccess
+            if (typeof value === 'string') {
+                store.put({ v: value, t: now }, key);
+            } else if (value && typeof value === 'object' && typeof value.v === 'string') {
+                store.put({ v: value.v, t: now }, key);
+            }
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
+// 批量更新 lastAccess（读到缓存命中时调用，用于让活跃数据不被 TTL 清掉）
+async function cacheTouchBatch(keys) {
+    if (!Array.isArray(keys) || keys.length === 0) return;
+    const db = await openCacheDB();
+    const now = Date.now();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        let pending = keys.length;
+        if (pending === 0) return resolve();
+        for (const key of keys) {
+            const getReq = store.get(key);
+            getReq.onsuccess = () => {
+                const raw = getReq.result;
+                const v = unwrapCacheValue(raw);
+                if (v !== null) store.put({ v, t: now }, key);
+                if (--pending === 0) { /* commit on tx.oncomplete */ }
+            };
+            getReq.onerror = () => {
+                if (--pending === 0) { /* swallow */ }
+            };
         }
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
@@ -72,6 +122,103 @@ async function cacheCount() {
         req.onerror = () => reject(req.error);
     });
 }
+
+// 估算单条记录的字节数（UTF-16 字符近似按 2 字节算 + JSON 包装开销）
+function estimateEntryBytes(key, value) {
+    const keyLen = typeof key === 'string' ? key.length : 0;
+    const valLen = typeof value === 'string' ? value.length :
+                   (value && typeof value.v === 'string' ? value.v.length : 0);
+    return (keyLen + valLen) * 2 + 24; // 24 字节作为 {v,t} 元数据近似
+}
+
+// 缓存清理：删除超过 TTL 的条目；若总字节超过 CACHE_MAX_BYTES，按 lastAccess 升序继续删
+async function cleanupCache() {
+    let db;
+    try {
+        db = await openCacheDB();
+    } catch (e) {
+        console.warn('YX翻译: 缓存清理打开 DB 失败', e);
+        return;
+    }
+    const now = Date.now();
+    const ttlCutoff = now - CACHE_TTL_MS;
+    // 阶段 1：收集所有条目元信息（key + t + bytes），并删过期
+    const survivors = []; // { key, t, bytes }
+    let totalBytes = 0;
+    let removedByTTL = 0;
+    await new Promise((resolve) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        const cursorReq = store.openCursor();
+        cursorReq.onsuccess = (e) => {
+            const cursor = e.target.result;
+            if (!cursor) return; // cursor 走完后由 tx.oncomplete 触发
+            const raw = cursor.value;
+            const v = unwrapCacheValue(raw);
+            // 兼容旧 v1 纯字符串数据：默认 t = now，给它一次活下来的机会
+            const t = (raw && typeof raw === 'object' && typeof raw.t === 'number') ? raw.t : now;
+            if (v === null) {
+                // 异常数据，删掉
+                cursor.delete();
+            } else if (t < ttlCutoff) {
+                cursor.delete();
+                removedByTTL++;
+            } else {
+                const bytes = estimateEntryBytes(cursor.key, raw);
+                survivors.push({ key: cursor.key, t, bytes });
+                totalBytes += bytes;
+            }
+            cursor.continue();
+        };
+        cursorReq.onerror = () => resolve();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+    });
+    // 阶段 2：超容量则按 t 升序删除最旧条目
+    let removedByCap = 0;
+    if (totalBytes > CACHE_MAX_BYTES) {
+        survivors.sort((a, b) => a.t - b.t); // 最旧排前面
+        await new Promise((resolve) => {
+            const tx = db.transaction(IDB_STORE, 'readwrite');
+            const store = tx.objectStore(IDB_STORE);
+            for (const item of survivors) {
+                if (totalBytes <= CACHE_MAX_BYTES) break;
+                store.delete(item.key);
+                totalBytes -= item.bytes;
+                removedByCap++;
+            }
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => resolve();
+        });
+    }
+    if (removedByTTL || removedByCap) {
+        console.log(`YX翻译: 缓存清理 - TTL 删除 ${removedByTTL} 条，超容量删除 ${removedByCap} 条，剩余 ~${(totalBytes / 1024 / 1024).toFixed(2)} MB`);
+    }
+}
+
+// 每天跑一次缓存清理；alarm 在 SW 重启后由 chrome 自动恢复触发
+chrome.alarms.create(CACHE_CLEANUP_ALARM, { periodInMinutes: 24 * 60 });
+
+// 写后清理 alarm（一次性）。用 chrome.alarms 而非 setTimeout：
+// 在 MV3 Service Worker 里，sendResponse 返回后 SW 随时可能被挂起，setTimeout 会一并销毁；
+// chrome.alarms 由浏览器管理，到点会唤醒 SW 触发 onAlarm，保证 50MB 硬上限可靠生效。
+const CACHE_CLEANUP_AFTER_PUT_ALARM = 'yx-cache-cleanup-after-put';
+
+function scheduleCleanupAfterPut() {
+    // 已经排过就不重复排；chrome.alarms.get 在不存在时回调返回 undefined
+    chrome.alarms.get(CACHE_CLEANUP_AFTER_PUT_ALARM, (existing) => {
+        if (existing) return;
+        // delayInMinutes 最小有效值为 1（生产环境，未启用 unpacked dev 例外），刚好作为 debounce 窗口
+        chrome.alarms.create(CACHE_CLEANUP_AFTER_PUT_ALARM, { delayInMinutes: 1 });
+    });
+}
+
+// 统一处理两个 alarm；一次性 alarm 触发后会自动从队列移除
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === CACHE_CLEANUP_ALARM || alarm.name === CACHE_CLEANUP_AFTER_PUT_ALARM) {
+        cleanupCache().catch(e => console.warn('YX翻译: 缓存清理失败', e));
+    }
+});
 
 // ===== Service Worker 生命周期保护 =====
 let activeTranslations = 0;
@@ -121,7 +268,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.type === 'CACHE_PUT_BATCH') {
     cachePutBatch(request.entries)
-      .then(() => sendResponse({ success: true }))
+      .then(() => {
+        // 写入后排一次 debounced cleanup，让 50MB 硬上限尽快生效
+        scheduleCleanupAfterPut();
+        sendResponse({ success: true });
+      })
       .catch(e => sendResponse({ success: false, error: e.message }));
     return true;
   }
@@ -140,15 +291,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  // 批量触摸 lastAccess（命中缓存后异步调用，让活跃数据不被 TTL 清掉）
+  if (request.type === 'CACHE_TOUCH') {
+    cacheTouchBatch(request.keys || [])
+      .then(() => sendResponse({ success: true }))
+      .catch(e => sendResponse({ success: false, error: e.message }));
+    return true;
+  }
+
   // 划词翻译引擎对比
   if (request.type === 'TRANSLATE_COMPARE') {
     (async () => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
       try {
         const text = request.text;
         const settings = await chrome.storage.local.get(['target_lang', 'translate_engine', 'api_keys']);
-        const targetLang = settings.target_lang || 'zh-CN';
-        const engine = settings.translate_engine || 'google_free';
-        const apiKeys = settings.api_keys || {};
+        const targetLang = normalizeTargetLang(settings.target_lang);
+        const engine = normalizeEngine(settings.translate_engine);
+        const apiKeys = (settings.api_keys && typeof settings.api_keys === 'object') ? settings.api_keys : {};
 
         const ENGINE_NAMES = {
           google_free: 'Google翻译(免费)', google_cloud: 'Google Cloud',
@@ -160,13 +321,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         if (engine === 'google_free') {
           // 当前引擎是 google_free，只返回一个结果
-          const r = await translateBulk([text], targetLang);
+          const r = await translateBulk([text], targetLang, controller.signal);
           results.primary = { engine: ENGINE_NAMES.google_free, text: r[text] || text };
         } else {
           // 并行调用：当前引擎 + google_free
           const [primaryResult, googleResult] = await Promise.allSettled([
-            translateByEngine([text], targetLang, engine, apiKeys),
-            translateBulk([text], targetLang)
+            translateByEngine([text], targetLang, engine, apiKeys, controller.signal),
+            translateBulk([text], targetLang, controller.signal)
           ]);
 
           results.primary = {
@@ -184,6 +345,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: true, results });
       } catch (error) {
         sendResponse({ success: false, error: error.message });
+      } finally {
+        clearTimeout(timeoutId);
       }
     })();
     return true;
@@ -205,8 +368,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // 获取引擎配置
+  // 获取引擎配置（仅扩展页面/popup 可读，content script 拒绝）
   if (request.type === 'GET_ENGINE_CONFIG') {
+    if (sender.tab || sender.id !== chrome.runtime.id) {
+      sendResponse({ success: false, error: 'forbidden' });
+      return false;
+    }
     chrome.storage.local.get(['translate_engine', 'api_keys'], (result) => {
       sendResponse({
         engine: result.translate_engine || 'google_free',
@@ -216,8 +383,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // 保存引擎配置
+  // 保存引擎配置（仅扩展页面/popup 可写，content script 拒绝；防止页面 XSS 后劫持 API Key）
   if (request.type === 'SAVE_ENGINE_CONFIG') {
+    if (sender.tab || sender.id !== chrome.runtime.id) {
+      sendResponse({ success: false, error: 'forbidden' });
+      return false;
+    }
     const data = {};
     if (request.engine) data.translate_engine = request.engine;
     if (request.apiKeys) data.api_keys = request.apiKeys;
@@ -341,6 +512,34 @@ async function handleBatchTranslation(texts) {
   }
 }
 
+// 允许的目标语言白名单：必须命中才允许进 URL / LLM prompt，避免任意字符串注入
+const ALLOWED_TARGET_LANGS = new Set([
+  'zh-CN', 'zh-TW', 'zh',
+  'en',
+  'ja',
+  'ko',
+  'fr', 'de', 'ru',
+  'es',
+  'pt', 'pt-BR', 'pt-PT',
+  'it', 'ar', 'th', 'vi'
+]);
+
+function normalizeTargetLang(raw) {
+  if (typeof raw !== 'string') return 'zh-CN';
+  return ALLOWED_TARGET_LANGS.has(raw) ? raw : 'zh-CN';
+}
+
+// 允许的引擎白名单
+const ALLOWED_ENGINES = new Set([
+  'google_free', 'google_cloud', 'deepl', 'baidu',
+  'openai', 'claude', 'deepseek', 'minimax', 'glm'
+]);
+
+function normalizeEngine(raw) {
+  if (typeof raw !== 'string') return 'google_free';
+  return ALLOWED_ENGINES.has(raw) ? raw : 'google_free';
+}
+
 async function _handleBatchTranslation(texts) {
   // 一次性读取目标语言和引擎设置
   let targetLang = 'zh-CN';
@@ -348,9 +547,9 @@ async function _handleBatchTranslation(texts) {
   let apiKeys = {};
   try {
     const settings = await chrome.storage.local.get(['target_lang', 'translate_engine', 'api_keys']);
-    if (settings.target_lang) targetLang = settings.target_lang;
-    if (settings.translate_engine) engine = settings.translate_engine;
-    if (settings.api_keys) apiKeys = settings.api_keys;
+    targetLang = normalizeTargetLang(settings.target_lang);
+    engine = normalizeEngine(settings.translate_engine);
+    if (settings.api_keys && typeof settings.api_keys === 'object') apiKeys = settings.api_keys;
   } catch (e) { /* 使用默认值 */ }
 
   // 将文本按字符总量分组，每组合并为一次 API 请求
@@ -373,21 +572,27 @@ async function _handleBatchTranslation(texts) {
   // 并行发送合并请求（最多 8 个并发）
   const results = {};
   const PARALLEL = 8;
+  const TRANSLATE_TIMEOUT_MS = 15000;
 
   for (let i = 0; i < bulkGroups.length; i += PARALLEL) {
     const batch = bulkGroups.slice(i, i + PARALLEL);
-    const promises = batch.map(group =>
-      Promise.race([
-        translateByEngine(group, targetLang, engine, apiKeys),
-        new Promise(resolve => {
-          setTimeout(() => {
-            const fallback = {};
-            group.forEach(t => fallback[t] = t);
-            resolve(fallback);
-          }, 15000); // LLM引擎需要更长超时
+    const promises = batch.map(group => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), TRANSLATE_TIMEOUT_MS);
+      return translateByEngine(group, targetLang, engine, apiKeys, controller.signal)
+        .catch(e => {
+          // 超时或全部失败：返回原文 fallback（abort 会自动取消正在跑的 fetch）
+          if (e?.name !== 'AbortError') {
+            console.warn('YX翻译: 翻译组失败，使用原文 fallback', e.message);
+          } else {
+            console.warn('YX翻译: 翻译组超时（>15s），已 abort 并返回原文');
+          }
+          const fallback = {};
+          group.forEach(t => fallback[t] = t);
+          return fallback;
         })
-      ])
-    );
+        .finally(() => clearTimeout(timeoutId));
+    });
     const batchResults = await Promise.all(promises);
     batchResults.forEach(r => Object.assign(results, r));
   }
@@ -395,30 +600,32 @@ async function _handleBatchTranslation(texts) {
 }
 
 // 根据引擎选择路由到不同翻译函数
-async function translateByEngine(texts, targetLang, engine, apiKeys) {
+async function translateByEngine(texts, targetLang, engine, apiKeys, signal) {
   try {
     switch (engine) {
       case 'google_cloud':
-        return await translateGoogleCloud(texts, targetLang, apiKeys.google_cloud);
+        return await translateGoogleCloud(texts, targetLang, apiKeys.google_cloud, signal);
       case 'deepl':
-        return await translateDeepL(texts, targetLang, apiKeys.deepl);
+        return await translateDeepL(texts, targetLang, apiKeys.deepl, signal);
       case 'baidu':
-        return await translateBaidu(texts, targetLang, apiKeys.baidu_appid, apiKeys.baidu_key);
+        return await translateBaidu(texts, targetLang, apiKeys.baidu_appid, apiKeys.baidu_key, signal);
       case 'openai':
       case 'claude':
       case 'deepseek':
       case 'minimax':
       case 'glm':
-        return await translateWithLLM(texts, targetLang, engine, apiKeys[engine]);
+        return await translateWithLLM(texts, targetLang, engine, apiKeys[engine], signal);
       case 'google_free':
       default:
-        return await translateBulk(texts, targetLang);
+        return await translateBulk(texts, targetLang, signal);
     }
   } catch (e) {
+    // abort 直接抛给上层，不进入回退逻辑（防止 abort 后还继续打 google_free）
+    if (signal?.aborted || e?.name === 'AbortError') throw e;
     console.warn(`YX翻译: ${engine} 引擎翻译失败，回退到免费Google翻译`, e.message);
     // 非google_free引擎失败时回退到免费Google翻译
     if (engine !== 'google_free') {
-      return await translateBulk(texts, targetLang);
+      return await translateBulk(texts, targetLang, signal);
     }
     // google_free本身失败，返回原文
     const fallback = {};
@@ -428,21 +635,21 @@ async function translateByEngine(texts, targetLang, engine, apiKeys) {
 }
 
 // 多条文本合并为一次 API 请求（用 \n 分隔）
-async function translateBulk(texts, targetLang) {
+async function translateBulk(texts, targetLang, signal) {
   // 单条文本走原有逻辑
   if (texts.length === 1) {
-    const r = await translateSingle(texts[0], 0, targetLang);
+    const r = await translateSingle(texts[0], 0, targetLang, signal);
     return { [r.original]: r.translated };
   }
 
   try {
     const joined = texts.join('\n');
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(joined)}`;
-    const response = await fetch(url);
+    const response = await fetch(url, { signal });
 
     if (response.status === 429) {
       // 限流时回退到逐条翻译（带重试）
-      return await translateBulkFallback(texts, targetLang);
+      return await translateBulkFallback(texts, targetLang, signal);
     }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
@@ -475,19 +682,23 @@ async function translateBulk(texts, targetLang) {
 
     // 行数不匹配：回退逐条翻译
     console.warn(`YX翻译: 合并翻译行数不匹配 (期望 ${texts.length}, 得到 ${translated.length})，回退逐条翻译`);
-    return await translateBulkFallback(texts, targetLang);
+    return await translateBulkFallback(texts, targetLang, signal);
   } catch (e) {
+    if (signal?.aborted || e?.name === 'AbortError') throw e;
     console.warn('YX翻译: 合并翻译失败，回退逐条翻译', e.message);
-    return await translateBulkFallback(texts, targetLang);
+    return await translateBulkFallback(texts, targetLang, signal);
   }
 }
 
 // 合并翻译失败时的逐条回退
-async function translateBulkFallback(texts, targetLang) {
+async function translateBulkFallback(texts, targetLang, signal) {
   const results = {};
   const promises = texts.map(text =>
-    translateSingle(text, 0, targetLang)
-      .catch(() => ({ original: text, translated: text }))
+    translateSingle(text, 0, targetLang, signal)
+      .catch(e => {
+        if (signal?.aborted || e?.name === 'AbortError') throw e;
+        return { original: text, translated: text };
+      })
   );
   const individual = await Promise.all(promises);
   individual.forEach(r => {
@@ -497,7 +708,7 @@ async function translateBulkFallback(texts, targetLang) {
 }
 
 // ========== Google Cloud Translation API v2 ==========
-async function translateGoogleCloud(texts, targetLang, apiKey) {
+async function translateGoogleCloud(texts, targetLang, apiKey, signal) {
   if (!apiKey) throw new Error('Google Cloud API密钥未配置');
 
   const results = {};
@@ -510,30 +721,35 @@ async function translateGoogleCloud(texts, targetLang, apiKey) {
       q: texts,
       target: targetLang, // Google Cloud API 支持 'zh-CN'、'zh-TW' 等完整语言代码
       format: 'text'
-    })
+    }),
+    signal
   });
 
   if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Google Cloud API 错误 ${response.status}: ${err}`);
+    // 错误体不透传，避免泄漏 key 片段或请求摘要
+    throw new Error(`Google Cloud API 错误 ${response.status}`);
   }
 
   const data = await response.json();
   const translations = data.data?.translations || [];
 
-  for (let i = 0; i < texts.length; i++) {
-    let translated = translations[i]?.translatedText || texts[i];
-    // 术语校对
-    if (targetLang.startsWith('zh')) {
-      translated = await refineTranslation(texts[i], translated);
+  if (targetLang.startsWith('zh')) {
+    // 中文：并行做术语校对（buildCompiledGlossary 内部已缓存）
+    const refined = await Promise.all(texts.map((src, i) => {
+      const raw = translations[i]?.translatedText || src;
+      return refineTranslation(src, raw);
+    }));
+    for (let i = 0; i < texts.length; i++) results[texts[i]] = refined[i];
+  } else {
+    for (let i = 0; i < texts.length; i++) {
+      results[texts[i]] = translations[i]?.translatedText || texts[i];
     }
-    results[texts[i]] = translated;
   }
   return results;
 }
 
 // ========== DeepL API ==========
-async function translateDeepL(texts, targetLang, apiKey) {
+async function translateDeepL(texts, targetLang, apiKey, signal) {
   if (!apiKey) throw new Error('DeepL API密钥未配置');
 
   // 判断是 Free 还是 Pro API（Free 密钥以 ':fx' 结尾）
@@ -560,24 +776,30 @@ async function translateDeepL(texts, targetLang, apiKey) {
       'Authorization': `DeepL-Auth-Key ${apiKey}`,
       'Content-Type': 'application/x-www-form-urlencoded'
     },
-    body: params.toString()
+    body: params.toString(),
+    signal
   });
 
   if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`DeepL API 错误 ${response.status}: ${err}`);
+    // 错误体不透传，避免泄漏 key 片段或请求摘要
+    throw new Error(`DeepL API 错误 ${response.status}`);
   }
 
   const data = await response.json();
   const results = {};
   const translations = data.translations || [];
 
-  for (let i = 0; i < texts.length; i++) {
-    let translated = translations[i]?.text || texts[i];
-    if (targetLang.startsWith('zh')) {
-      translated = await refineTranslation(texts[i], translated);
+  if (targetLang.startsWith('zh')) {
+    // 中文：并行做术语校对
+    const refined = await Promise.all(texts.map((src, i) => {
+      const raw = translations[i]?.text || src;
+      return refineTranslation(src, raw);
+    }));
+    for (let i = 0; i < texts.length; i++) results[texts[i]] = refined[i];
+  } else {
+    for (let i = 0; i < texts.length; i++) {
+      results[texts[i]] = translations[i]?.text || texts[i];
     }
-    results[texts[i]] = translated;
   }
   return results;
 }
@@ -755,7 +977,7 @@ function md5(string) {
   return hex(state);
 }
 
-async function translateBaidu(texts, targetLang, appId, key) {
+async function translateBaidu(texts, targetLang, appId, key, signal) {
   if (!appId || !key) throw new Error('百度翻译AppID或密钥未配置');
 
   // 百度翻译目标语言映射
@@ -780,7 +1002,8 @@ async function translateBaidu(texts, targetLang, appId, key) {
   const response = await fetch('https://fanyi-api.baidu.com/api/trans/vip/translate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString()
+    body: params.toString(),
+    signal
   });
 
   if (!response.ok) throw new Error(`百度翻译 HTTP ${response.status}`);
@@ -793,30 +1016,38 @@ async function translateBaidu(texts, targetLang, appId, key) {
 
   // 百度翻译返回 src/dst 对，按 \n 分隔的文本会返回多条结果
   if (transResult.length === texts.length) {
-    for (let i = 0; i < texts.length; i++) {
-      let translated = transResult[i]?.dst || texts[i];
-      if (targetLang.startsWith('zh')) {
-        translated = await refineTranslation(texts[i], translated);
+    if (targetLang.startsWith('zh')) {
+      const refined = await Promise.all(texts.map((src, i) => {
+        const raw = transResult[i]?.dst || src;
+        return refineTranslation(src, raw);
+      }));
+      for (let i = 0; i < texts.length; i++) results[texts[i]] = refined[i];
+    } else {
+      for (let i = 0; i < texts.length; i++) {
+        results[texts[i]] = transResult[i]?.dst || texts[i];
       }
-      results[texts[i]] = translated;
     }
   } else {
     // 行数不匹配时尝试按原文匹配
     const dstMap = new Map();
     transResult.forEach(r => dstMap.set(r.src, r.dst));
-    for (const text of texts) {
-      let translated = dstMap.get(text) || text;
-      if (targetLang.startsWith('zh') && translated !== text) {
-        translated = await refineTranslation(text, translated);
+    if (targetLang.startsWith('zh')) {
+      const refined = await Promise.all(texts.map(text => {
+        const raw = dstMap.get(text) || text;
+        return raw === text ? Promise.resolve(text) : refineTranslation(text, raw);
+      }));
+      for (let i = 0; i < texts.length; i++) results[texts[i]] = refined[i];
+    } else {
+      for (const text of texts) {
+        results[text] = dstMap.get(text) || text;
       }
-      results[text] = translated;
     }
   }
   return results;
 }
 
 // ========== LLM 统一翻译接口（OpenAI / Claude / DeepSeek） ==========
-async function translateWithLLM(texts, targetLang, engine, apiKey) {
+async function translateWithLLM(texts, targetLang, engine, apiKey, signal) {
   if (!apiKey) throw new Error(`${engine} API密钥未配置`);
 
   // 目标语言名称映射（用于提示词）
@@ -903,12 +1134,13 @@ async function translateWithLLM(texts, targetLang, engine, apiKey) {
   const response = await fetch(config.url, {
     method: 'POST',
     headers: config.headers,
-    body: config.buildBody(systemPrompt, userMessage)
+    body: config.buildBody(systemPrompt, userMessage),
+    signal
   });
 
   if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`${engine} API 错误 ${response.status}: ${err}`);
+    // 错误体不透传，避免泄漏 key 片段或请求摘要
+    throw new Error(`${engine} API 错误 ${response.status}`);
   }
 
   const data = await response.json();
@@ -1818,12 +2050,12 @@ const AI_GLOSSARY = {
 };
 
 // 备选翻译源：MyMemory API
-async function translateFallback(text, targetLang = 'zh-CN') {
+async function translateFallback(text, targetLang = 'zh-CN', signal) {
   try {
     // MyMemory 使用 'source|target' 格式的语言对，auto 表示自动检测源语言
     const langPair = `auto|${targetLang}`;
     const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langPair)}`;
-    const response = await fetch(url);
+    const response = await fetch(url, { signal });
     if (!response.ok) throw new Error(`MyMemory HTTP ${response.status}`);
     const data = await response.json();
     if (data && data.responseData && data.responseData.translatedText) {
@@ -1831,13 +2063,14 @@ async function translateFallback(text, targetLang = 'zh-CN') {
     }
     return null;
   } catch (e) {
+    if (signal?.aborted || e?.name === 'AbortError') throw e;
     console.warn('YX翻译: MyMemory 备选翻译失败', e.message);
     return null;
   }
 }
 
 // 翻译单条文本（带重试和退避机制）
-async function translateSingle(text, retryCount = 0, targetLang = 'zh-CN') {
+async function translateSingle(text, retryCount = 0, targetLang = 'zh-CN', signal) {
   if (!text || !text.trim()) return { original: text, translated: text };
 
   const MAX_RETRIES = 2;
@@ -1845,14 +2078,15 @@ async function translateSingle(text, retryCount = 0, targetLang = 'zh-CN') {
 
   try {
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
-    const response = await fetch(url);
+    const response = await fetch(url, { signal });
 
     // 处理 429 限流错误
     if (response.status === 429 && retryCount < MAX_RETRIES) {
       const delay = RETRY_DELAY * Math.pow(2, retryCount); // 指数退避
       console.warn(`YX翻译: API 限流，${delay}ms 后重试...`);
       await new Promise(resolve => setTimeout(resolve, delay));
-      return translateSingle(text, retryCount + 1, targetLang);
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      return translateSingle(text, retryCount + 1, targetLang, signal);
     }
 
     if (!response.ok) {
@@ -1878,9 +2112,10 @@ async function translateSingle(text, retryCount = 0, targetLang = 'zh-CN') {
     }
     return { original: text, translated: text };
   } catch (error) {
+    if (signal?.aborted || error?.name === 'AbortError') throw error;
     console.warn(`YX翻译: Google 翻译失败 - ${error.message}，尝试备选翻译源...`);
     // Google 翻译失败时尝试 MyMemory
-    const fallbackResult = await translateFallback(text, targetLang);
+    const fallbackResult = await translateFallback(text, targetLang, signal);
     if (fallbackResult) {
       let result = fallbackResult;
       if (targetLang.startsWith('zh')) {

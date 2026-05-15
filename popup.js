@@ -280,7 +280,7 @@ function renderGlossaryList(list) {
         glossaryList.textContent = '暂无自定义术语';
         return;
     }
-    list.forEach((item, index) => {
+    list.forEach((item) => {
         const div = document.createElement('div');
         div.className = 'glossary-item';
         const span = document.createElement('span');
@@ -288,7 +288,8 @@ function renderGlossaryList(list) {
         const delBtn = document.createElement('button');
         delBtn.className = 'del-btn';
         delBtn.textContent = '\u2715';
-        delBtn.addEventListener('click', () => deleteGlossaryItem(index));
+        const sig = glossarySignature(item);
+        delBtn.addEventListener('click', () => deleteGlossaryItemBySignature(sig));
         div.appendChild(span);
         div.appendChild(delBtn);
         glossaryList.appendChild(div);
@@ -314,13 +315,25 @@ document.getElementById('glossaryAddBtn').addEventListener('click', () => {
     });
 });
 
-function deleteGlossaryItem(index) {
+// 用三元组生成稳定签名，避免依赖数组 index（连点删除时数组已变，index 不稳会删错条目）
+function glossarySignature(item) {
+    return `${item.keyword}${item.badWord}${item.goodWord}`;
+}
+
+// 按签名删除：每次都从最新存储中读 list 再过滤匹配项
+function deleteGlossaryItemBySignature(sig) {
     chrome.storage.sync.get(['user_glossary'], (result) => {
         if (chrome.runtime.lastError) return;
         const list = result.user_glossary || [];
-        list.splice(index, 1);
-        chrome.storage.sync.set({ user_glossary: list }, () => {
+        // 用 filter 而非 splice(index)：即使同时点了多个删除按钮，每次都基于最新 list 操作
+        const newList = list.filter(item => glossarySignature(item) !== sig);
+        if (newList.length === list.length) {
+            // 已被别的请求删过，刷新列表即可
             renderGlossaryList(list);
+            return;
+        }
+        chrome.storage.sync.set({ user_glossary: newList }, () => {
+            renderGlossaryList(newList);
         });
     });
 }
