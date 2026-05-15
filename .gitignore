@@ -8,6 +8,7 @@ build/
 .env
 .vscode/
 .idea/
+.claude/
 tmp/
 # Ignore promotional assets not needed for code repo
 promo_*.png
