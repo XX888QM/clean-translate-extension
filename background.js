@@ -324,12 +324,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const engine = normalizeEngine(settings.translate_engine);
         const apiKeys = (settings.api_keys && typeof settings.api_keys === 'object') ? settings.api_keys : {};
 
-        const ENGINE_NAMES = {
-          google_free: 'Google翻译(免费)', google_cloud: 'Google Cloud',
-          deepl: 'DeepL', baidu: '百度翻译', openai: 'OpenAI GPT',
-          claude: 'Claude', deepseek: 'DeepSeek', minimax: 'MiniMax', glm: '智谱GLM'
-        };
-
         const results = {};
 
         if (engine === 'google_free') {
@@ -509,28 +503,69 @@ async function handleBatchTranslation(texts) {
   }
 }
 
+// 统一目标语言表（单一真相源）：name=LLM 提示词用的中文名；deepl/baidu=各引擎专用语言代码。
+// ALLOWED_TARGET_LANGS 与各引擎语言映射全部由此派生，避免多张分散的表互相不一致。
+const LANGS = {
+  'zh-CN': { name: '简体中文', deepl: 'ZH-HANS', baidu: 'zh' },
+  'zh-TW': { name: '繁体中文', deepl: 'ZH-HANT', baidu: 'cht' },
+  'zh':    { name: '中文', deepl: 'ZH-HANS', baidu: 'zh' },
+  'en':    { name: '英文', deepl: 'EN-US', baidu: 'en' },
+  'ja':    { name: '日文', baidu: 'jp' },
+  'ko':    { name: '韩文', baidu: 'kor' },
+  'fr':    { name: '法文', baidu: 'fra' },
+  'de':    { name: '德文', baidu: 'de' },
+  'ru':    { name: '俄文', baidu: 'ru' },
+  'es':    { name: '西班牙文', baidu: 'spa' },
+  'pt':    { name: '葡萄牙文', deepl: 'PT-BR', baidu: 'pt' },
+  'pt-BR': { name: '巴西葡萄牙文', deepl: 'PT-BR' },
+  'pt-PT': { name: '葡萄牙文', deepl: 'PT-PT' },
+  'it':    { name: '意大利文', baidu: 'it' },
+  'ar':    { name: '阿拉伯文', baidu: 'ara' },
+  'th':    { name: '泰文', baidu: 'th' },
+  'vi':    { name: '越南文', baidu: 'vie' }
+};
+
+// 从 LANGS 派生指定字段的 { 语言代码: 值 } 映射（跳过未定义该字段的语言）
+function deriveLangMap(field) {
+  const m = {};
+  for (const [code, info] of Object.entries(LANGS)) {
+    if (info[field] !== undefined) m[code] = info[field];
+  }
+  return m;
+}
+
 // 允许的目标语言白名单：必须命中才允许进 URL / LLM prompt，避免任意字符串注入
-const ALLOWED_TARGET_LANGS = new Set([
-  'zh-CN', 'zh-TW', 'zh',
-  'en',
-  'ja',
-  'ko',
-  'fr', 'de', 'ru',
-  'es',
-  'pt', 'pt-BR', 'pt-PT',
-  'it', 'ar', 'th', 'vi'
-]);
+const ALLOWED_TARGET_LANGS = new Set(Object.keys(LANGS));
+const DEEPL_LANG_MAP = deriveLangMap('deepl');   // DeepL 专用语言代码
+const BAIDU_LANG_MAP = deriveLangMap('baidu');   // 百度专用语言代码
+const LANG_NAMES = deriveLangMap('name');        // LLM 提示词用的中文语言名
 
 function normalizeTargetLang(raw) {
   if (typeof raw !== 'string') return 'zh-CN';
   return ALLOWED_TARGET_LANGS.has(raw) ? raw : 'zh-CN';
 }
 
-// 允许的引擎白名单
-const ALLOWED_ENGINES = new Set([
-  'google_free', 'google_cloud', 'deepl', 'baidu',
-  'openai', 'claude', 'deepseek', 'minimax', 'glm'
-]);
+// 统一翻译引擎表（单一真相源）：name=显示名（划词对比框用）；isLLM=是否走 LLM 编号列表协议。
+// ALLOWED_ENGINES 与 ENGINE_NAMES 由此派生。新增引擎在此加一项，再按 CLAUDE.md 清单补
+// translateByEngine 路由 / translateWithLLM engineConfig / popup 三处实现即可。
+const ENGINE_REGISTRY = {
+  google_free:  { name: 'Google翻译(免费)', isLLM: false },
+  google_cloud: { name: 'Google Cloud', isLLM: false },
+  deepl:        { name: 'DeepL', isLLM: false },
+  baidu:        { name: '百度翻译', isLLM: false },
+  openai:       { name: 'OpenAI GPT', isLLM: true },
+  claude:       { name: 'Claude', isLLM: true },
+  deepseek:     { name: 'DeepSeek', isLLM: true },
+  minimax:      { name: 'MiniMax', isLLM: true },
+  glm:          { name: '智谱GLM', isLLM: true }
+};
+
+// 允许的引擎白名单（派生自注册表）
+const ALLOWED_ENGINES = new Set(Object.keys(ENGINE_REGISTRY));
+// 引擎显示名映射（派生自注册表，供划词翻译对比框使用）
+const ENGINE_NAMES = Object.fromEntries(
+  Object.entries(ENGINE_REGISTRY).map(([id, info]) => [id, info.name])
+);
 
 function normalizeEngine(raw) {
   if (typeof raw !== 'string') return 'google_free';
@@ -762,12 +797,8 @@ async function translateDeepL(texts, targetLang, apiKey, signal) {
     ? 'https://api-free.deepl.com/v2/translate'
     : 'https://api.deepl.com/v2/translate';
 
-  // DeepL 目标语言映射
-  const deeplLangMap = {
-    'zh-CN': 'ZH-HANS', 'zh-TW': 'ZH-HANT', 'zh': 'ZH-HANS',
-    'en': 'EN-US', 'pt': 'PT-BR', 'pt-BR': 'PT-BR', 'pt-PT': 'PT-PT'
-  };
-  const deeplTarget = deeplLangMap[targetLang] || targetLang.toUpperCase();
+  // DeepL 目标语言代码（统一表 LANGS 派生）
+  const deeplTarget = DEEPL_LANG_MAP[targetLang] || targetLang.toUpperCase();
 
   // DeepL 支持批量文本（通过多个 text 参数）
   const params = new URLSearchParams();
@@ -984,15 +1015,8 @@ function md5(string) {
 async function translateBaidu(texts, targetLang, appId, key, signal) {
   if (!appId || !key) throw new Error('百度翻译AppID或密钥未配置');
 
-  // 百度翻译目标语言映射
-  const baiduLangMap = {
-    'zh-CN': 'zh', 'zh-TW': 'cht', 'zh': 'zh',
-    'en': 'en', 'ja': 'jp', 'ko': 'kor',
-    'fr': 'fra', 'de': 'de', 'ru': 'ru',
-    'es': 'spa', 'pt': 'pt', 'it': 'it',
-    'ar': 'ara', 'th': 'th', 'vi': 'vie'
-  };
-  const to = baiduLangMap[targetLang] || targetLang;
+  // 百度翻译目标语言代码（统一表 LANGS 派生）
+  const to = BAIDU_LANG_MAP[targetLang] || targetLang;
 
   // 百度 API 支持用 \n 分隔的多条文本
   const query = texts.join('\n');
@@ -1079,15 +1103,8 @@ function parseLLMReply(replyText, texts) {
 async function translateWithLLM(texts, targetLang, engine, apiKey, signal) {
   if (!apiKey) throw new Error(`${engine} API密钥未配置`);
 
-  // 目标语言名称映射（用于提示词）
-  const langNames = {
-    'zh-CN': '简体中文', 'zh-TW': '繁体中文', 'zh': '中文',
-    'en': '英文', 'ja': '日文', 'ko': '韩文',
-    'fr': '法文', 'de': '德文', 'ru': '俄文',
-    'es': '西班牙文', 'pt': '葡萄牙文', 'pt-BR': '巴西葡萄牙文', 'pt-PT': '葡萄牙文',
-    'it': '意大利文', 'ar': '阿拉伯文', 'th': '泰文', 'vi': '越南文'
-  };
-  const langName = langNames[targetLang] || targetLang;
+  // 目标语言中文名（用于提示词，统一表 LANGS 派生）
+  const langName = LANG_NAMES[targetLang] || targetLang;
 
   // 将多条文本用编号列表格式发送，减少API调用次数
   const numberedTexts = buildNumberedPrompt(texts);
@@ -2270,5 +2287,14 @@ if (typeof module !== 'undefined' && module.exports) {
     parseLLMReply,
     buildCompiledGlossary,
     refineTranslation,
+    // 第5批：语言/引擎单一真相源及派生（供等价性回归测试）
+    LANGS,
+    ALLOWED_TARGET_LANGS,
+    DEEPL_LANG_MAP,
+    BAIDU_LANG_MAP,
+    LANG_NAMES,
+    ENGINE_REGISTRY,
+    ALLOWED_ENGINES,
+    ENGINE_NAMES,
   };
 }

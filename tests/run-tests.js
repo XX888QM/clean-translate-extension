@@ -108,8 +108,9 @@ function calculateChineseRatio(text) {
     return chineseChars.length / text.length;
 }
 // shouldAutoTranslate：源码内联于 content.js checkAutoTranslate，未导出，此处为镜像
-function shouldAutoTranslate(mode, sitePref, isInWhitelist, isInExcludeList) {
+function shouldAutoTranslate(mode, sitePref, isInWhitelist, isInExcludeList, isSensitive = false) {
     if (sitePref === 'never') return false;
+    if (isSensitive) return false;
     if (sitePref === 'auto') return true;
     switch (mode) {
         case 'auto_all': return !isInExcludeList;
@@ -359,6 +360,11 @@ await describe('shouldAutoTranslate [镜像：content.js 内联于 checkAutoTran
     await it('网站偏好 auto 始终翻译', () => {
         assert.equal(shouldAutoTranslate('manual', 'auto', false, false), true);
     });
+    await it('敏感域名即使有 auto 偏好也不自动翻译', () => {
+        assert.equal(shouldAutoTranslate('manual', 'auto', false, false, true), false);
+        assert.equal(shouldAutoTranslate('auto_all', null, false, false, true), false);
+        assert.equal(shouldAutoTranslate('whitelist', null, true, false, true), false);
+    });
     await it('auto_all 翻译非排除域名', () => {
         assert.equal(shouldAutoTranslate('auto_all', null, false, false), true);
         assert.equal(shouldAutoTranslate('auto_all', null, false, true), false);
@@ -369,6 +375,111 @@ await describe('shouldAutoTranslate [镜像：content.js 内联于 checkAutoTran
     });
     await it('manual 不自动翻译', () => {
         assert.equal(shouldAutoTranslate('manual', null, true, false), false);
+    });
+});
+
+await describe('isSensitiveHost [真源码 content.js — 第3批隐私黑名单]', async () => {
+    const f = ct.isSensitiveHost;
+    await it('file:// 协议视为敏感', () => assert.equal(f('', 'file:'), true));
+    await it('localhost / 本机 / 环回视为敏感', () => {
+        assert.equal(f('localhost', 'http:'), true);
+        assert.equal(f('foo.localhost', 'http:'), true);
+        assert.equal(f('127.0.0.1', 'http:'), true);
+        assert.equal(f('127.0.0.2', 'http:'), true);
+        assert.equal(f('0.0.0.0', 'http:'), true);
+        assert.equal(f('[::1]', 'http:'), true);
+    });
+    await it('私网 / 链路本地 IPv4 段视为敏感', () => {
+        assert.equal(f('192.168.1.1', 'http:'), true);
+        assert.equal(f('10.0.0.5', 'http:'), true);
+        assert.equal(f('172.16.0.1', 'http:'), true);
+        assert.equal(f('172.31.255.255', 'http:'), true);
+        assert.equal(f('169.254.1.1', 'http:'), true);
+    });
+    await it('公网 172.x（非私网段）不敏感', () => {
+        assert.equal(f('172.15.0.1', 'http:'), false);
+        assert.equal(f('172.32.0.1', 'http:'), false);
+    });
+    await it('私有/链路本地 IPv6（ULA/link-local）视为敏感', () => {
+        assert.equal(f('[fd00::1]', 'http:'), true);
+        assert.equal(f('[fc00::1]', 'http:'), true);
+        assert.equal(f('[fe80::1]', 'http:'), true);
+    });
+    await it('.local / .internal 内网域敏感', () => {
+        assert.equal(f('myserver.local', 'http:'), true);
+        assert.equal(f('api.internal', 'http:'), true);
+    });
+    await it('含敏感关键词的域名敏感', () => {
+        assert.equal(f('mybank.com', 'https:'), true);
+        assert.equal(f('login.example.com', 'https:'), true);
+        assert.equal(f('accounts.google.com', 'https:'), true);
+        assert.equal(f('admin.site.com', 'https:'), true);
+    });
+    await it('邮箱站点视为敏感（注释承诺覆盖邮箱）', () => {
+        assert.equal(f('mail.google.com', 'https:'), true);
+        assert.equal(f('gmail.com', 'https:'), true);
+        assert.equal(f('outlook.live.com', 'https:'), true);
+        assert.equal(f('proton.me', 'https:'), true);
+    });
+    await it('普通网站不敏感', () => {
+        assert.equal(f('example.com', 'https:'), false);
+        assert.equal(f('news.ycombinator.com', 'https:'), false);
+        assert.equal(f('github.com', 'https:'), false);
+    });
+    await it('空 hostname + 非 file 协议不敏感', () => assert.equal(f('', 'https:'), false));
+});
+
+await describe('语言表单一源派生等价 [真源码 background.js — 第5批, deepEqual 锁死原值]', async () => {
+    await it('ALLOWED_TARGET_LANGS 含全部 17 种语言', () => {
+        const expected = ['zh-CN','zh-TW','zh','en','ja','ko','fr','de','ru','es','pt','pt-BR','pt-PT','it','ar','th','vi'];
+        for (const k of expected) assert.ok(bg.ALLOWED_TARGET_LANGS.has(k), `缺 ${k}`);
+        assert.equal(bg.ALLOWED_TARGET_LANGS.size, expected.length);
+    });
+    await it('DEEPL_LANG_MAP 与原表逐键等价', () => {
+        assert.deepEqual(bg.DEEPL_LANG_MAP, {
+            'zh-CN': 'ZH-HANS', 'zh-TW': 'ZH-HANT', 'zh': 'ZH-HANS',
+            'en': 'EN-US', 'pt': 'PT-BR', 'pt-BR': 'PT-BR', 'pt-PT': 'PT-PT'
+        });
+    });
+    await it('BAIDU_LANG_MAP 与原表逐键等价', () => {
+        assert.deepEqual(bg.BAIDU_LANG_MAP, {
+            'zh-CN': 'zh', 'zh-TW': 'cht', 'zh': 'zh',
+            'en': 'en', 'ja': 'jp', 'ko': 'kor',
+            'fr': 'fra', 'de': 'de', 'ru': 'ru',
+            'es': 'spa', 'pt': 'pt', 'it': 'it',
+            'ar': 'ara', 'th': 'th', 'vi': 'vie'
+        });
+    });
+    await it('LANG_NAMES 与原表逐键等价（含上批补的 ar/th/vi/pt-BR/pt-PT）', () => {
+        assert.deepEqual(bg.LANG_NAMES, {
+            'zh-CN': '简体中文', 'zh-TW': '繁体中文', 'zh': '中文',
+            'en': '英文', 'ja': '日文', 'ko': '韩文',
+            'fr': '法文', 'de': '德文', 'ru': '俄文',
+            'es': '西班牙文', 'pt': '葡萄牙文', 'pt-BR': '巴西葡萄牙文', 'pt-PT': '葡萄牙文',
+            'it': '意大利文', 'ar': '阿拉伯文', 'th': '泰文', 'vi': '越南文'
+        });
+    });
+});
+
+await describe('引擎注册表派生等价 [真源码 background.js — 第5批]', async () => {
+    await it('ALLOWED_ENGINES 含全部 9 引擎', () => {
+        const expected = ['google_free','google_cloud','deepl','baidu','openai','claude','deepseek','minimax','glm'];
+        for (const e of expected) assert.ok(bg.ALLOWED_ENGINES.has(e), `缺 ${e}`);
+        assert.equal(bg.ALLOWED_ENGINES.size, expected.length);
+    });
+    await it('ENGINE_NAMES 与原显示名逐键等价', () => {
+        assert.deepEqual(bg.ENGINE_NAMES, {
+            google_free: 'Google翻译(免费)', google_cloud: 'Google Cloud',
+            deepl: 'DeepL', baidu: '百度翻译', openai: 'OpenAI GPT',
+            claude: 'Claude', deepseek: 'DeepSeek', minimax: 'MiniMax', glm: '智谱GLM'
+        });
+    });
+    await it('ENGINE_REGISTRY 的 isLLM 标记正确', () => {
+        assert.equal(bg.ENGINE_REGISTRY.openai.isLLM, true);
+        assert.equal(bg.ENGINE_REGISTRY.claude.isLLM, true);
+        assert.equal(bg.ENGINE_REGISTRY.glm.isLLM, true);
+        assert.equal(bg.ENGINE_REGISTRY.google_free.isLLM, false);
+        assert.equal(bg.ENGINE_REGISTRY.deepl.isLLM, false);
     });
 });
 

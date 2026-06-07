@@ -1328,6 +1328,35 @@ function triggerAutoTranslate(targetLang) {
     }
 }
 
+// 敏感域名/协议判定（纯函数，便于测试）：本地文件、本机、私网、含敏感关键词的 host
+// 默认不【自动】翻译，避免把网银/邮箱/内网后台等明文内容自动外发第三方接口；用户仍可手动翻译
+function isSensitiveHost(hostname, protocol) {
+    if (protocol === 'file:') return true;
+    if (!hostname) return false;
+    const host = hostname.toLowerCase();
+    // 本机 / 环回
+    if (host === 'localhost' || host.endsWith('.localhost')) return true;
+    if (host === '0.0.0.0') return true;
+    if (/^127\./.test(host)) return true;                  // 127.0.0.0/8 整段环回
+    if (host === '::1' || host === '[::1]') return true;
+    // 内网保留域名
+    if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan')) return true;
+    // 私有 / 链路本地 IPv4 段
+    if (/^10\.\d+\.\d+\.\d+$/.test(host)) return true;                  // 10.0.0.0/8
+    if (/^192\.168\.\d+\.\d+$/.test(host)) return true;                // 192.168.0.0/16
+    if (/^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(host)) return true;  // 172.16.0.0/12
+    if (/^169\.254\.\d+\.\d+$/.test(host)) return true;                // 169.254.0.0/16 链路本地
+    // 私有 / 链路本地 IPv6（hostname 带方括号）：ULA fc00::/7、link-local fe80::/10
+    if (/^\[f[cd]/.test(host)) return true;
+    if (/^\[fe[89ab]/.test(host)) return true;
+    // 含敏感关键词的域名（网银/登录/账户/后台/钱包/支付/邮箱）
+    const SENSITIVE_KEYWORDS = [
+        'bank', 'login', 'signin', 'account', 'admin', 'wallet', 'payment', 'paypal',
+        'mail', 'email', 'webmail', 'inbox', 'outlook', 'proton'
+    ];
+    return SENSITIVE_KEYWORDS.some(kw => host.includes(kw));
+}
+
 function checkAutoTranslate() {
     if (autoTranslateTriggered || isTranslated || isTranslating) return;
     if (!chrome.runtime?.id) return;
@@ -1346,9 +1375,15 @@ function checkAutoTranslate() {
             const sitePrefs = result.site_preferences || {};
             const sitePref = sitePrefs[currentHost];
 
-            // 1. 网站偏好优先级最高
+            // 1. "从不翻译"优先级最高
             if (sitePref === 'never') {
                 console.log(`YX翻译: 域名 ${currentHost} 偏好为"从不翻译"`);
+                return;
+            }
+            // 2. 敏感域名强制不自动翻译，避免历史 auto 偏好或白名单导致明文自动外发；
+            // 用户仍可手动逐次翻译，但不会被静默记为长期自动翻译。
+            if (isSensitiveHost(currentHost, window.location.protocol)) {
+                console.log(`YX翻译: 域名 ${currentHost} 命中敏感黑名单，默认不自动翻译（可手动翻译）`);
                 return;
             }
             if (sitePref === 'auto') {
@@ -1356,7 +1391,7 @@ function checkAutoTranslate() {
                 return;
             }
 
-            // 2. 根据翻译模式决定（兼容旧版 auto_translate_enabled）
+            // 3. 根据翻译模式决定（兼容旧版 auto_translate_enabled）
             const mode = result.translate_mode ||
                 (result.auto_translate_enabled === false ? 'manual' : 'auto_all');
 
@@ -1431,10 +1466,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (!chrome.runtime?.id) return;
 
     if (request.type === 'START_TRANSLATE') {
-        // 记录网站翻译偏好（手动点击翻译时）
+        // 记录网站翻译偏好（手动点击翻译时）；但敏感站点（邮箱/网银/内网等）不静默记为"自动"，
+        // 避免一次手动翻译把敏感域名变成长期自动外发（隐私默认更硬，仍可手动逐次翻译）
         if (request.recordPreference) {
             const host = window.location.hostname;
-            if (host) {
+            if (host && !isSensitiveHost(host, window.location.protocol)) {
                 chrome.storage.local.get(['site_preferences'], (result) => {
                     if (chrome.runtime.lastError) return;
                     const prefs = { ...(result.site_preferences || {}), [host]: 'auto' };
@@ -1479,6 +1515,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 if (__TEST__) {
     module.exports = {
         isTextTranslatable,
+        isSensitiveHost,
         cacheGet,
         cacheSet,
         translationCache,
