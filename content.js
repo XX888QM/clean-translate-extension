@@ -629,6 +629,8 @@ async function sendMessageWithRetry(message, maxRetries = 2) {
 // 状态管理
 let isTranslated = false;
 let isTranslating = false; // 翻译锁，防止并发执行
+// 翻译代际令牌：还原 / 切换语言时自增，使在途的旧翻译响应回写失效（防 stale 结果覆盖已还原内容）
+let translationGeneration = 0;
 let observer = null;
 let mutationDebounceTimer = null; // 防抖计时器
 let cacheSaveTimer = null; // 缓存保存防抖计时器
@@ -850,6 +852,8 @@ function clearCache() {
 }
 
 function restoreOriginal() {
+    // 作废所有在途翻译：之后回来的 chunk 响应会因代际不符被丢弃，不会覆盖已还原内容
+    translationGeneration++;
     showToast('正在还原原文...', 'loading');
     hideProgressBar();
     hideOriginalTooltip();
@@ -904,30 +908,34 @@ async function performTranslation(root = document.body) {
         isTranslating = true;
     }
 
+    // 每次翻译用独立的命中 key 集合：多条翻译链（整页 + 视口子树）并发时互不清空
+    const touchedKeys = new Set();
     try {
-        await _doTranslation(root);
+        await _doTranslation(root, touchedKeys);
     } finally {
         if (root === document.body) {
             isTranslating = false;
         }
-        // 兜底：异常退出时也要把已收集的 touch keys 发出去，防止泄漏到下次调用
-        flushCacheTouches();
+        // 兜底：异常退出时也要把已收集的 touch keys 发出去（_doTranslation 内已 flush 则此处为空操作）
+        flushCacheTouches(touchedKeys);
     }
 }
 
-// 收集本次翻译命中缓存的 key，结束时异步 touch 让活跃数据不被 TTL 淘汰
-const cacheTouchedKeys = new Set();
-
-// 把累计的 cache 命中 key 异步发到 background 更新 lastAccess；不 await，失败忽略
-function flushCacheTouches() {
-    if (cacheTouchedKeys.size === 0 || !chrome.runtime?.id) return;
-    const keys = Array.from(cacheTouchedKeys);
-    cacheTouchedKeys.clear();
+// 把传入的 cache 命中 key 集合异步发到 background 更新 lastAccess；不 await，失败忽略
+function flushCacheTouches(keysSet) {
+    if (!keysSet || keysSet.size === 0 || !chrome.runtime?.id) return;
+    const keys = Array.from(keysSet);
+    keysSet.clear();
     sendMessageWithRetry({ type: 'CACHE_TOUCH', keys })
         .catch(() => { /* 忽略 touch 失败 */ });
 }
 
-async function _doTranslation(root = document.body) {
+async function _doTranslation(root = document.body, touchedKeys = new Set()) {
+    // 记录本次翻译代际（在任何 await 之前捕获）：还原/切语言会自增代际，
+    // 后续每个回写点（含缓存命中同步回写、异步 chunk 回写）比对代际，不符即丢弃，
+    // 防止在 storage 读取 / 缓存加载等 await 间隙被还原后，stale 结果又覆盖已还原的 DOM
+    let myGen = translationGeneration;
+
     // 读取目标语言和双语模式设置
     let targetLang = 'zh-CN';
     try {
@@ -967,11 +975,21 @@ async function _doTranslation(root = document.body) {
         translationCache.clear();
         cacheLoaded = false;
         isTranslated = false;
+        // 切换语言：作废旧语言在途翻译，并把本次翻译归入新代际（避免自己被误判 stale）
+        translationGeneration++;
+        myGen = translationGeneration;
     }
     currentTargetLang = targetLang;
 
     // 仅首次拉一次全量缓存；子树翻译/MutationObserver 不再重复 dump 全库
     await ensureCacheLoaded();
+
+    // 代际检查：storage 读取 / 缓存加载这些 await 间隙内若用户已还原 / 切语言，立即丢弃，
+    // 避免下面命中缓存的【同步回写】把已还原的 DOM 又写回译文（此处进度条尚未显示，无需 hide）
+    if (myGen !== translationGeneration) {
+        flushCacheTouches(touchedKeys);
+        return;
+    }
 
     const nodes = getTextNodes(root);
     const textNodeMap = new Map();
@@ -987,7 +1005,7 @@ async function _doTranslation(root = document.body) {
         if (cached !== undefined) {
             translateStats.cacheHits++;
             translateStats.totalTranslated++;
-            cacheTouchedKeys.add(text);
+            touchedKeys.add(text);
             applyTextToNode(node, cached);
         } else {
             if (!textNodeMap.has(text)) textNodeMap.set(text, []);
@@ -1008,7 +1026,7 @@ async function _doTranslation(root = document.body) {
             if (cachedTitle !== undefined) {
                 document.title = cachedTitle;
                 translateStats.cacheHits++;
-                cacheTouchedKeys.add(titleText);
+                touchedKeys.add(titleText);
             } else {
                 missingTranslations.add(titleText);
                 if (!textNodeMap.has(titleText)) textNodeMap.set(titleText, []);
@@ -1033,7 +1051,7 @@ async function _doTranslation(root = document.body) {
             if (cached !== undefined) {
                 element.setAttribute(attr, cached);
                 translateStats.cacheHits++;
-                cacheTouchedKeys.add(text);
+                touchedKeys.add(text);
             } else {
                 missingTranslations.add(text);
                 if (!textNodeMap.has(text)) textNodeMap.set(text, []);
@@ -1046,7 +1064,7 @@ async function _doTranslation(root = document.body) {
     if (textsToTranslate.length === 0) {
         isTranslated = true;
         // 全部命中缓存的情况：仍需 flush 已收集的命中 key，否则 lastAccess 永不更新
-        flushCacheTouches();
+        flushCacheTouches(touchedKeys);
         return;
     }
 
@@ -1064,7 +1082,7 @@ async function _doTranslation(root = document.body) {
     const CHUNK_SIZE = 200;
     const MAX_CONCURRENT = 3; // 最多同时发送 3 个 chunk
     let translatedCount = 0;
-    let errorCount = 0;
+    let consecutiveFailedBatches = 0; // 连续"整批全失败"的批次数，用于熔断
 
     // 构建所有 chunk
     const chunks = [];
@@ -1087,9 +1105,17 @@ async function _doTranslation(root = document.body) {
 
         const results = await Promise.all(promises);
 
+        // 代际检查：在途期间用户已还原 / 切换语言 → 丢弃 stale 结果，停止回写
+        if (myGen !== translationGeneration) {
+            if (isFullPage && showProgress) hideProgressBar();
+            return;
+        }
+
+        let batchSuccess = 0;
+        let batchFailure = 0;
         for (const { response, error, chunk } of results) {
             if (error) {
-                errorCount++;
+                batchFailure++;
                 console.warn('YX翻译: 翻译消息错误:', error);
                 continue;
             }
@@ -1100,11 +1126,19 @@ async function _doTranslation(root = document.body) {
                 translatedCount += chunk.length;
                 translateStats.apiCalls += chunk.length;
                 translateStats.totalTranslated += chunk.length;
-                errorCount = 0;
+                batchSuccess++;
             } else if (response && !response.success) {
-                errorCount++;
+                batchFailure++;
                 console.warn('YX翻译: 批次翻译失败', response.error);
             }
+        }
+
+        // 熔断：只有"整批全部失败"才累加；本批有任一成功即清零。
+        // 旧逻辑在单 chunk 成功时清零整体计数，导致间歇性失败永远攒不到阈值
+        if (batchSuccess > 0) {
+            consecutiveFailedBatches = 0;
+        } else if (batchFailure > 0) {
+            consecutiveFailedBatches++;
         }
 
         // 更新进度
@@ -1114,8 +1148,8 @@ async function _doTranslation(root = document.body) {
             showToast(`翻译中 ${translatedCount}/${totalCount} (${percent}%)`, 'loading');
         }
 
-        // 连续错误过多时中止
-        if (errorCount >= 3) {
+        // 连续两批整批失败 → 熔断中止
+        if (consecutiveFailedBatches >= 2) {
             if (isFullPage) hideProgressBar();
             showToast('翻译遇到问题，部分内容可能未翻译', 'success');
             break;
@@ -1129,7 +1163,7 @@ async function _doTranslation(root = document.body) {
     isTranslated = true;
 
     // 异步触摸 lastAccess，让活跃缓存数据不被 TTL 清掉（不 await，失败也不影响主流程）
-    flushCacheTouches();
+    flushCacheTouches(touchedKeys);
 }
 
 function applyTextToNode(node, translatedText) {

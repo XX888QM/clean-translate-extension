@@ -10,9 +10,24 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 天未访问就清掉
 const CACHE_MAX_BYTES = 50 * 1024 * 1024;      // 硬上限 50MB
 const CACHE_CLEANUP_ALARM = 'yx-cache-cleanup';
 
+// IndexedDB 不可用降级标志：隐私模式 / 配额耗尽 / 被企业策略禁用时 IDB 打不开，
+// 置位后缓存操作直接快速失败，避免每次翻译都反复 openDB 失败刷错误日志
+let idbUnavailable = false;
+
 function openCacheDB() {
     return new Promise((resolve, reject) => {
-        const request = indexedDB.open(IDB_NAME, IDB_VERSION);
+        if (idbUnavailable) {
+            reject(new Error('IndexedDB 不可用（已降级）'));
+            return;
+        }
+        let request;
+        try {
+            request = indexedDB.open(IDB_NAME, IDB_VERSION);
+        } catch (e) {
+            idbUnavailable = true;
+            reject(e);
+            return;
+        }
         request.onupgradeneeded = (e) => {
             const db = e.target.result;
             if (!db.objectStoreNames.contains(IDB_STORE)) {
@@ -21,7 +36,10 @@ function openCacheDB() {
             // v1 → v2 没有结构变化，只是 value 格式由 string 变 {v,t}；读时兼容即可
         };
         request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
+        request.onerror = () => {
+            idbUnavailable = true;
+            reject(request.error);
+        };
     });
 }
 
