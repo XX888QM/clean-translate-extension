@@ -95,7 +95,16 @@ node tests/run-tests.js
 
 ## 📝 Changelog
 
-### v1.5.1 (current)
+### v1.5.2 (current)
+- 隐私：敏感域名（邮箱/网银/本机/私网/内网/`file://`）默认不自动翻译，堵住 whitelist 模式与历史 `auto` 偏好等绕过路径；敏感站手动翻译不再静默记为长期自动外发
+- 可靠性：翻译代际令牌，「还原 / 切换语言」后丢弃在途结果，杜绝译文回冒；视口子树翻译用独立 touch 集合避免并发互相清空；熔断改为批级（间歇失败不再永远攒不到阈值）；IndexedDB 不可用时优雅降级
+- 性能：术语校对 `refineTranslation` 预编译短路正则，整页中文校对实测快 16~42x（行为零变化）
+- 重构：目标语言表（`LANGS`）与翻译引擎表（`ENGINE_REGISTRY`）改为单一真相源派生，消除 4 张语言表 / 6 处引擎元数据分散
+- 体验：付费引擎未配置 API Key 时弹提示（不再静默回退免费 Google）；LLM 提示词补全 ar/th/vi/pt-BR 等语言名；`translateBulk` 组内去重省重复请求
+- 测试：改为 `require` 真源码（不再测复制粘贴副本，曾因此漏过崩溃 bug），用例 29 → 83
+- 工程：统一行尾为 LF + `.gitattributes`；删除操作废弃 storage 键的死代码消息
+
+### v1.5.1
 - fetch 全链路 AbortController + 15s 超时取消，杜绝请求悬空
 - IDB 缓存升级 schema v2：`lastAccess` 字段 + 30 天过期 + 50 MB 上限
 - 缓存清理改用 `chrome.alarms`（daily + 写后一次性 alarm），SW 休眠也可靠
