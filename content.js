@@ -1,3 +1,6 @@
+// 测试环境标记：Node require 时为真，浏览器中 module 未定义为假（不影响扩展运行）
+const __TEST__ = (typeof module !== 'undefined' && module.exports);
+
 // 基础配置
 const MIN_TEXT_LENGTH = 2;
 const MAX_CACHE_SIZE = 10000; // 缓存最大条目数（约占用 3-5MB 存储空间）
@@ -611,7 +614,8 @@ async function sendMessageWithRetry(message, maxRetries = 2) {
             const msg = e.message || '';
             const isDisconnected = msg.includes('Extension context invalidated') ||
                                    msg.includes('Could not establish connection') ||
-                                   msg.includes('Receiving end does not exist');
+                                   msg.includes('Receiving end does not exist') ||
+                                   msg.includes('message port closed');
             if (isDisconnected && attempt < maxRetries) {
                 // Service Worker 可能被终止了，等待后重试（发消息会唤醒 SW）
                 await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
@@ -718,34 +722,38 @@ const IGNORED_TAGS = new Set([
     'KBD', 'SAMP', 'VAR', 'IFRAME', 'IMG', 'SVG', 'PATH', 'METADATA'
 ]);
 
-function isTranslatable(node) {
-    const parent = node.parentNode;
-    if (!parent) return false;
-
-    if (IGNORED_TAGS.has(parent.tagName)) return false;
-    if (parent.isContentEditable) return false;
+// 纯文本可翻译判定（无 DOM 依赖，便于测试）。参数：文本、父标签名、父 class 字符串、是否可编辑
+function isTextTranslatable(text, parentTagName, parentClassName, isEditable) {
+    if (IGNORED_TAGS.has(parentTagName)) return false;
+    if (isEditable) return false;
 
     // Check parent classes for icon indicators
-    if (parent.className && typeof parent.className === 'string') {
-        const cls = parent.className.toLowerCase();
+    if (parentClassName && typeof parentClassName === 'string') {
+        const cls = parentClassName.toLowerCase();
         if (cls.includes('material-icons') || cls.includes('material-symbols') ||
             cls.includes('fa-') || cls.includes('icon') || cls.includes('glyph')) {
             return false;
         }
     }
 
-    const text = node.nodeValue.trim();
-    if (text.length < MIN_TEXT_LENGTH) return false;
+    const trimmed = (text || '').trim();
+    if (trimmed.length < MIN_TEXT_LENGTH) return false;
 
-    if (/^\d+$/.test(text)) return false;
-    if (/^[^\p{L}]+$/u.test(text)) return false;
+    if (/^\d+$/.test(trimmed)) return false;
+    if (/^[^\p{L}]+$/u.test(trimmed)) return false;
     // JSON-like or Caps-constants
-    if (/^\{.*\}$/.test(text) || /^[A-Z0-9_]+$/.test(text)) return false;
+    if (/^\{.*\}$/.test(trimmed) || /^[A-Z0-9_]+$/.test(trimmed)) return false;
 
     // Ignore snake_case strings often used for ligatures (e.g. keyboard_arrow_down)
-    if (/^[a-z0-9]+(_[a-z0-9]+)+$/.test(text)) return false;
+    if (/^[a-z0-9]+(_[a-z0-9]+)+$/.test(trimmed)) return false;
 
     return true;
+}
+
+function isTranslatable(node) {
+    const parent = node.parentNode;
+    if (!parent) return false;
+    return isTextTranslatable(node.nodeValue, parent.tagName, parent.className, parent.isContentEditable);
 }
 
 function getTextNodes(root = document.body) {
@@ -1376,10 +1384,13 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-} else {
-    init();
+// 测试环境下不触发页面初始化（init 会操作 DOM / 注册观察器）
+if (!__TEST__) {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -1429,3 +1440,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse(translateStats);
     }
 });
+
+// ===== 测试导出（仅 Node 环境；浏览器中 module 未定义，不影响运行）=====
+if (__TEST__) {
+    module.exports = {
+        isTextTranslatable,
+        cacheGet,
+        cacheSet,
+        translationCache,
+        MAX_CACHE_SIZE,
+    };
+}

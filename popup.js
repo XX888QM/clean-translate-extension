@@ -391,6 +391,16 @@ function updateApiKeyPanel(engine) {
     if (engine === 'baidu') {
       baiduAppIdInput.value = keys.baidu_appid || '';
     }
+    // 缺 Key 提示：未配置时翻译会临时回退免费 Google，明确告知用户避免"以为在用付费引擎"
+    const hasKey = !!(keys[keyName] && keys[keyName].trim()) &&
+                   (engine !== 'baidu' || !!(keys.baidu_appid && keys.baidu_appid.trim()));
+    if (!hasKey) {
+      apiKeyHint.textContent = '⚠ 未配置 API Key，翻译将临时使用免费 Google 翻译';
+      apiKeyHint.style.color = '#d93025';
+    } else {
+      apiKeyHint.textContent = ENGINE_HINTS[engine] || '';
+      apiKeyHint.style.color = '';
+    }
   });
 }
 
@@ -433,6 +443,8 @@ apiKeySaveBtn.addEventListener('click', () => {
       }
       apiKeySaveBtn.textContent = '已保存';
       setTimeout(() => { apiKeySaveBtn.textContent = '保存'; }, 2000);
+      // 保存后刷新面板，清除"未配置"红字提示
+      updateApiKeyPanel(engine);
     });
   });
 });

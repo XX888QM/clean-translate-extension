@@ -1,23 +1,28 @@
 #!/usr/bin/env node
 // YX纯净网页翻译 — 轻量测试运行器
-// 用法: node tests/run-tests.js
+// 用法: node tests/run-tests.js  (或 npm test)
+//
+// 设计：先 mock 浏览器全局环境（chrome / window / document 等），再 require 真源码，
+//      使测试覆盖【真正的源码函数】而非复制粘贴的副本（历史上副本与源码漂移曾漏过崩溃 bug）。
+//      源码用 __TEST__ / typeof module 守卫，在 Node 下跳过 DOM 初始化副作用、导出纯函数。
 
 const assert = require('node:assert/strict');
 
+// ===== 测试运行器（支持 async 测试）=====
 let totalTests = 0;
 let passedTests = 0;
 let failedTests = 0;
 const failures = [];
 
-function describe(name, fn) {
+async function describe(name, fn) {
     console.log(`\n  ${name}`);
-    fn();
+    await fn();
 }
 
-function it(name, fn) {
+async function it(name, fn) {
     totalTests++;
     try {
-        fn();
+        await fn();
         passedTests++;
         console.log(`    ✓ ${name}`);
     } catch (e) {
@@ -28,262 +33,360 @@ function it(name, fn) {
     }
 }
 
-// ===== 从源码中提取的纯函数（用于测试） =====
+// ===== 浏览器环境 mock：让 Node 能安全 require 真源码 =====
+const noop = () => {};
+const listener = { addListener: noop, removeListener: noop, hasListener: () => false };
 
-const MIN_TEXT_LENGTH = 2;
-const IGNORED_TAGS = new Set([
-    'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'PRE', 'CODE',
-    'KBD', 'SAMP', 'VAR', 'IFRAME', 'IMG', 'SVG', 'PATH', 'METADATA'
-]);
-
-// 模拟 isTranslatable 的核心判断逻辑（不含 DOM 依赖）
-function isTextTranslatable(text, parentTagName, parentClassName, isEditable) {
-    if (IGNORED_TAGS.has(parentTagName)) return false;
-    if (isEditable) return false;
-
-    if (parentClassName && typeof parentClassName === 'string') {
-        const cls = parentClassName.toLowerCase();
-        if (cls.includes('material-icons') || cls.includes('material-symbols') ||
-            cls.includes('fa-') || cls.includes('icon') || cls.includes('glyph')) {
-            return false;
-        }
-    }
-
-    const trimmed = text.trim();
-    if (trimmed.length < MIN_TEXT_LENGTH) return false;
-    if (/^\d+$/.test(trimmed)) return false;
-    if (/^[^\p{L}]+$/u.test(trimmed)) return false;
-    if (/^\{.*\}$/.test(trimmed) || /^[A-Z0-9_]+$/.test(trimmed)) return false;
-    if (/^[a-z0-9]+(_[a-z0-9]+)+$/.test(trimmed)) return false;
-
-    return true;
+// chrome.storage 区域：可被测试改写（用于 refineTranslation 的 user_glossary 场景）
+function makeStorageArea() {
+    return {
+        _data: {},
+        get(keys, cb) {
+            const result = {};
+            const want = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : Object.keys(keys || {}));
+            for (const k of want) if (k in this._data) result[k] = this._data[k];
+            if (typeof cb === 'function') { cb(result); return; }
+            return Promise.resolve(result);
+        },
+        set(items, cb) { Object.assign(this._data, items); if (cb) cb(); return Promise.resolve(); },
+        remove(keys, cb) {
+            for (const k of (Array.isArray(keys) ? keys : [keys])) delete this._data[k];
+            if (cb) cb(); return Promise.resolve();
+        },
+    };
 }
 
-// LRU 缓存
+global.chrome = {
+    runtime: {
+        id: 'test-extension-id',
+        lastError: null,
+        onMessage: listener,
+        onInstalled: listener,
+        sendMessage: (msg, cb) => { if (typeof cb === 'function') cb(undefined); return Promise.resolve(undefined); },
+        getPlatformInfo: (cb) => { const info = { os: 'mac' }; if (cb) cb(info); return Promise.resolve(info); },
+    },
+    storage: {
+        sync: makeStorageArea(),
+        local: makeStorageArea(),
+        onChanged: listener,
+    },
+    alarms: { create: noop, get: (n, cb) => { if (cb) cb(undefined); }, onAlarm: listener, clear: noop },
+    contextMenus: { create: noop, onClicked: listener, removeAll: (cb) => { if (cb) cb(); } },
+    commands: { onCommand: listener },
+    action: { setBadgeText: noop, setBadgeBackgroundColor: noop },
+    tabs: { query: (q, cb) => { if (cb) cb([]); return Promise.resolve([]); }, sendMessage: noop },
+    i18n: { getMessage: (k) => k },
+};
+
+global.window = {
+    addEventListener: noop, removeEventListener: noop,
+    location: { hostname: 'test.local', href: 'http://test.local/' },
+    getSelection: () => ({ rangeCount: 0 }),
+};
+global.document = {
+    addEventListener: noop, removeEventListener: noop,
+    readyState: 'complete', visibilityState: 'visible',
+    createElement: () => ({ style: {}, setAttribute: noop, appendChild: noop, addEventListener: noop, classList: { add: noop } }),
+    head: { appendChild: noop }, body: null,
+    getElementById: () => null, querySelector: () => null, querySelectorAll: () => [],
+    createTreeWalker: () => ({ nextNode: () => null, currentNode: null }),
+};
+global.self = global;
+global.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+global.IntersectionObserver = class { observe() {} disconnect() {} unobserve() {} };
+global.NodeFilter = { SHOW_TEXT: 4, SHOW_ELEMENT: 1 };
+
+// ===== require 真源码（__TEST__ 守卫已跳过 DOM 初始化）=====
+const bg = require('../background.js');
+const ct = require('../content.js');
+
+// ===== 镜像逻辑（源码内联、尚未导出的部分，标注以待后续抽取）=====
+// calculateChineseRatio：源码内联于 content.js detectPageLanguage，未导出，此处为镜像
+function calculateChineseRatio(text) {
+    if (!text || text.length === 0) return 0;
+    const chineseChars = text.match(/[一-龥]/g) || [];
+    return chineseChars.length / text.length;
+}
+// shouldAutoTranslate：源码内联于 content.js checkAutoTranslate，未导出，此处为镜像
+function shouldAutoTranslate(mode, sitePref, isInWhitelist, isInExcludeList) {
+    if (sitePref === 'never') return false;
+    if (sitePref === 'auto') return true;
+    switch (mode) {
+        case 'auto_all': return !isInExcludeList;
+        case 'whitelist': return isInWhitelist;
+        case 'manual': return false;
+        default: return true;
+    }
+}
+// LRU 容量淘汰镜像：真源码 MAX_CACHE_SIZE=10000，端到端测淘汰需插万级条目，故用小容量镜像验证淘汰逻辑
 function createLRUCache(maxSize) {
     const cache = new Map();
     return {
         get(key) {
-            if (cache.has(key)) {
-                const value = cache.get(key);
-                cache.delete(key);
-                cache.set(key, value);
-                return value;
-            }
+            if (cache.has(key)) { const v = cache.get(key); cache.delete(key); cache.set(key, v); return v; }
             return undefined;
         },
         set(key, value) {
             if (cache.has(key)) cache.delete(key);
             cache.set(key, value);
-            if (cache.size > maxSize) {
-                const firstKey = cache.keys().next().value;
-                cache.delete(firstKey);
-            }
+            if (cache.size > maxSize) cache.delete(cache.keys().next().value);
         },
         size() { return cache.size; },
-        clear() { cache.clear(); },
-        entries() { return Array.from(cache.entries()); }
     };
 }
 
-// 中文字符占比计算
-function calculateChineseRatio(text) {
-    if (!text || text.length === 0) return 0;
-    const chineseChars = text.match(/[\u4e00-\u9fa5]/g) || [];
-    return chineseChars.length / text.length;
-}
-
-// 翻译模式决策逻辑
-function shouldAutoTranslate(mode, sitePref, isInWhitelist, isInExcludeList) {
-    // 网站偏好优先级最高
-    if (sitePref === 'never') return false;
-    if (sitePref === 'auto') return true;
-
-    // 根据模式决定
-    switch (mode) {
-        case 'auto_all':
-            return !isInExcludeList;
-        case 'whitelist':
-            return isInWhitelist;
-        case 'manual':
-            return false;
-        default:
-            return true;
-    }
-}
-
 // ===== 测试用例 =====
+async function main() {
 
-describe('isTextTranslatable', () => {
-    it('应该翻译正常英文文本', () => {
-        assert.equal(isTextTranslatable('Hello World', 'DIV', '', false), true);
+await describe('isTextTranslatable [真源码 content.js]', async () => {
+    const f = ct.isTextTranslatable;
+    await it('应该翻译正常英文文本', () => assert.equal(f('Hello World', 'DIV', '', false), true));
+    await it('应该跳过 SCRIPT 标签内文本', () => assert.equal(f('var x = 1', 'SCRIPT', '', false), false));
+    await it('应该跳过 STYLE 标签内文本', () => assert.equal(f('.cls { color: red }', 'STYLE', '', false), false));
+    await it('应该跳过 CODE 标签内文本', () => assert.equal(f('console.log()', 'CODE', '', false), false));
+    await it('应该跳过 contentEditable 元素', () => assert.equal(f('editable text', 'DIV', '', true), false));
+    await it('应该跳过 icon class 元素', () => {
+        assert.equal(f('arrow_back', 'SPAN', 'material-icons', false), false);
+        assert.equal(f('home', 'I', 'fa-icon', false), false);
     });
-
-    it('应该跳过 SCRIPT 标签内文本', () => {
-        assert.equal(isTextTranslatable('var x = 1', 'SCRIPT', '', false), false);
+    await it('应该跳过太短的文本', () => assert.equal(f('a', 'DIV', '', false), false));
+    await it('应该跳过纯数字', () => assert.equal(f('12345', 'DIV', '', false), false));
+    await it('应该跳过纯符号', () => {
+        assert.equal(f('---', 'DIV', '', false), false);
+        assert.equal(f('***', 'DIV', '', false), false);
     });
-
-    it('应该跳过 STYLE 标签内文本', () => {
-        assert.equal(isTextTranslatable('.cls { color: red }', 'STYLE', '', false), false);
+    await it('应该跳过 JSON 格式文本', () => assert.equal(f('{"key":"value"}', 'DIV', '', false), false));
+    await it('应该跳过全大写常量', () => {
+        assert.equal(f('MAX_SIZE', 'DIV', '', false), false);
+        assert.equal(f('API_KEY_NAME', 'DIV', '', false), false);
     });
+    await it('应该跳过 snake_case 字符串', () => assert.equal(f('keyboard_arrow_down', 'DIV', '', false), false));
+    await it('应该翻译混合文本', () => assert.equal(f('Hello 123 World', 'DIV', '', false), true));
+    await it('nodeValue 为 null 不应抛错（健壮性）', () => assert.equal(f(null, 'DIV', '', false), false));
+});
 
-    it('应该跳过 CODE 标签内文本', () => {
-        assert.equal(isTextTranslatable('console.log()', 'CODE', '', false), false);
+await describe('LRU 内存缓存 [真源码 content.js cacheGet/cacheSet]', async () => {
+    const reset = () => ct.translationCache.clear();
+    await it('应该正确存取值', () => { reset(); ct.cacheSet('a', '翻译A'); assert.equal(ct.cacheGet('a'), '翻译A'); });
+    await it('不存在的键应返回 undefined', () => { reset(); assert.equal(ct.cacheGet('missing'), undefined); });
+    await it('访问后应移到最近使用（末尾）', () => {
+        reset(); ct.cacheSet('a', '1'); ct.cacheSet('b', '2'); ct.cacheSet('c', '3');
+        ct.cacheGet('a'); // a 移到末尾
+        assert.deepEqual([...ct.translationCache.keys()], ['b', 'c', 'a']);
     });
-
-    it('应该跳过 contentEditable 元素', () => {
-        assert.equal(isTextTranslatable('editable text', 'DIV', '', true), false);
+    await it('覆盖已有键应更新值且不增容量', () => {
+        reset(); ct.cacheSet('a', '旧值'); ct.cacheSet('a', '新值');
+        assert.equal(ct.cacheGet('a'), '新值');
+        assert.equal(ct.translationCache.size, 1);
     });
-
-    it('应该跳过 icon class 元素', () => {
-        assert.equal(isTextTranslatable('arrow_back', 'SPAN', 'material-icons', false), false);
-        assert.equal(isTextTranslatable('home', 'I', 'fa-icon', false), false);
+    await it('clear 应清空缓存', () => {
+        reset(); ct.cacheSet('a', '1'); ct.cacheSet('b', '2'); ct.translationCache.clear();
+        assert.equal(ct.translationCache.size, 0);
     });
-
-    it('应该跳过太短的文本', () => {
-        assert.equal(isTextTranslatable('a', 'DIV', '', false), false);
+    // 淘汰逻辑用小容量镜像（真 MAX_CACHE_SIZE=10000）
+    await it('[镜像] 超出容量时应淘汰最旧条目', () => {
+        const c = createLRUCache(3);
+        c.set('a', '1'); c.set('b', '2'); c.set('c', '3'); c.set('d', '4');
+        assert.equal(c.get('a'), undefined);
+        assert.equal(c.get('d'), '4');
     });
-
-    it('应该跳过纯数字', () => {
-        assert.equal(isTextTranslatable('12345', 'DIV', '', false), false);
-    });
-
-    it('应该跳过纯符号', () => {
-        assert.equal(isTextTranslatable('---', 'DIV', '', false), false);
-        assert.equal(isTextTranslatable('***', 'DIV', '', false), false);
-    });
-
-    it('应该跳过 JSON 格式文本', () => {
-        assert.equal(isTextTranslatable('{"key":"value"}', 'DIV', '', false), false);
-    });
-
-    it('应该跳过全大写常量', () => {
-        assert.equal(isTextTranslatable('MAX_SIZE', 'DIV', '', false), false);
-        assert.equal(isTextTranslatable('API_KEY_NAME', 'DIV', '', false), false);
-    });
-
-    it('应该跳过 snake_case 字符串', () => {
-        assert.equal(isTextTranslatable('keyboard_arrow_down', 'DIV', '', false), false);
-    });
-
-    it('应该翻译混合文本', () => {
-        assert.equal(isTextTranslatable('Hello 123 World', 'DIV', '', false), true);
+    await it('[镜像] 访问后最近使用项不被淘汰', () => {
+        const c = createLRUCache(3);
+        c.set('a', '1'); c.set('b', '2'); c.set('c', '3');
+        c.get('a'); c.set('d', '4'); // 应淘汰 b
+        assert.equal(c.get('a'), '1');
+        assert.equal(c.get('b'), undefined);
     });
 });
 
-describe('LRU 缓存', () => {
-    it('应该正确存取值', () => {
-        const cache = createLRUCache(5);
-        cache.set('a', '翻译A');
-        assert.equal(cache.get('a'), '翻译A');
+await describe('normalizeTargetLang / normalizeEngine [真源码 background.js]', async () => {
+    await it('白名单语言原样透传', () => {
+        assert.equal(bg.normalizeTargetLang('zh-CN'), 'zh-CN');
+        assert.equal(bg.normalizeTargetLang('ja'), 'ja');
+        assert.equal(bg.normalizeTargetLang('vi'), 'vi');
     });
-
-    it('不存在的键应返回 undefined', () => {
-        const cache = createLRUCache(5);
-        assert.equal(cache.get('missing'), undefined);
+    await it('非白名单语言回退 zh-CN', () => {
+        assert.equal(bg.normalizeTargetLang('klingon'), 'zh-CN');
+        assert.equal(bg.normalizeTargetLang('__proto__'), 'zh-CN');
     });
-
-    it('超出容量时应淘汰最旧条目', () => {
-        const cache = createLRUCache(3);
-        cache.set('a', '1');
-        cache.set('b', '2');
-        cache.set('c', '3');
-        cache.set('d', '4'); // 'a' 应被淘汰
-        assert.equal(cache.get('a'), undefined);
-        assert.equal(cache.get('b'), '2');
-        assert.equal(cache.get('d'), '4');
+    await it('非字符串回退 zh-CN', () => {
+        assert.equal(bg.normalizeTargetLang(null), 'zh-CN');
+        assert.equal(bg.normalizeTargetLang(123), 'zh-CN');
+        assert.equal(bg.normalizeTargetLang(undefined), 'zh-CN');
     });
-
-    it('访问后应移到最近使用（不被淘汰）', () => {
-        const cache = createLRUCache(3);
-        cache.set('a', '1');
-        cache.set('b', '2');
-        cache.set('c', '3');
-        cache.get('a'); // 访问 'a'，使其变为最近使用
-        cache.set('d', '4'); // 'b' 应被淘汰（而非 'a'）
-        assert.equal(cache.get('a'), '1');
-        assert.equal(cache.get('b'), undefined);
+    await it('白名单引擎原样透传', () => {
+        assert.equal(bg.normalizeEngine('claude'), 'claude');
+        assert.equal(bg.normalizeEngine('deepl'), 'deepl');
     });
-
-    it('覆盖已有键应更新值', () => {
-        const cache = createLRUCache(3);
-        cache.set('a', '旧值');
-        cache.set('a', '新值');
-        assert.equal(cache.get('a'), '新值');
-        assert.equal(cache.size(), 1);
-    });
-
-    it('clear 应清空缓存', () => {
-        const cache = createLRUCache(5);
-        cache.set('a', '1');
-        cache.set('b', '2');
-        cache.clear();
-        assert.equal(cache.size(), 0);
-        assert.equal(cache.get('a'), undefined);
+    await it('非白名单/非字符串引擎回退 google_free', () => {
+        assert.equal(bg.normalizeEngine('evil'), 'google_free');
+        assert.equal(bg.normalizeEngine('__proto__'), 'google_free');
+        assert.equal(bg.normalizeEngine(null), 'google_free');
+        assert.equal(bg.normalizeEngine(42), 'google_free');
     });
 });
 
-describe('calculateChineseRatio', () => {
-    it('纯中文应返回 1', () => {
-        assert.equal(calculateChineseRatio('你好世界'), 1);
+await describe('unwrapCacheValue [真源码 background.js]', async () => {
+    await it('v1 纯字符串原样返回', () => assert.equal(bg.unwrapCacheValue('译文'), '译文'));
+    await it('v2 {v,t} 解包出 v', () => assert.equal(bg.unwrapCacheValue({ v: '译文', t: 123 }), '译文'));
+    await it('缺 v 字段返回 null', () => assert.equal(bg.unwrapCacheValue({ t: 123 }), null));
+    await it('null/undefined 返回 null', () => {
+        assert.equal(bg.unwrapCacheValue(null), null);
+        assert.equal(bg.unwrapCacheValue(undefined), null);
     });
+    await it('v 非字符串返回 null', () => assert.equal(bg.unwrapCacheValue({ v: 123, t: 1 }), null));
+});
 
-    it('纯英文应返回 0', () => {
-        assert.equal(calculateChineseRatio('Hello World'), 0);
-    });
+await describe('estimateEntryBytes [真源码 background.js]', async () => {
+    await it('字符串 value：(key+val)*2 + 24', () => assert.equal(bg.estimateEntryBytes('ab', 'cd'), (2 + 2) * 2 + 24));
+    await it('{v} 对象 value：按 v 长度算', () => assert.equal(bg.estimateEntryBytes('ab', { v: 'cd', t: 1 }), (2 + 2) * 2 + 24));
+    await it('空 key/非法 value 退化为 24', () => assert.equal(bg.estimateEntryBytes('', { t: 1 }), 0 + 24));
+});
 
-    it('混合文本应返回正确占比', () => {
-        const ratio = calculateChineseRatio('你好Hello');
-        // 2个中文 / 7个总字符 ≈ 0.2857
-        assert.ok(ratio > 0.28 && ratio < 0.29);
-    });
-
-    it('空文本应返回 0', () => {
-        assert.equal(calculateChineseRatio(''), 0);
-        assert.equal(calculateChineseRatio(null), 0);
-    });
-
-    it('中文占比 > 0.3 应判定为中文页面', () => {
-        const ratio = calculateChineseRatio('这是一个中文页面的示例文本内容abc');
-        assert.ok(ratio > 0.3);
+await describe('md5 [真源码 background.js — 百度签名依赖，错一位即签名全失败]', async () => {
+    await it("md5('abc')", () => assert.equal(bg.md5('abc'), '900150983cd24fb0d6963f7d28e17f72'));
+    await it("md5('')", () => assert.equal(bg.md5(''), 'd41d8cd98f00b204e9800998ecf8427e'));
+    await it("md5('hello')", () => assert.equal(bg.md5('hello'), '5d41402abc4b2a76b9719d911017c592'));
+    await it('md5(UTF-8 中文) 应与标准一致', () => {
+        const crypto = require('node:crypto');
+        const expected = crypto.createHash('md5').update('你好', 'utf8').digest('hex');
+        assert.equal(bg.md5('你好'), expected);
     });
 });
 
-describe('shouldAutoTranslate（翻译模式决策）', () => {
-    it('网站偏好 never 应始终不翻译', () => {
+await describe('parseBulkResponse [真源码 background.js]', async () => {
+    await it('正常多段拼接按 \\n 拆分、行数匹配', () => {
+        const data = [[['你好\n世界', null]]];
+        const r = bg.parseBulkResponse(data, 2);
+        assert.deepEqual(r.translated, ['你好', '世界']);
+        assert.equal(r.matched, true);
+    });
+    await it('行数不匹配 matched=false', () => {
+        const r = bg.parseBulkResponse([[['只有一行', null]]], 3);
+        assert.equal(r.matched, false);
+    });
+    await it('data[0] 含空段被过滤', () => {
+        const data = [[['行一', null], [null], ['', null], ['行二', null]]];
+        const r = bg.parseBulkResponse(data, 1);
+        assert.deepEqual(r.translated, ['行一行二']);
+    });
+    await it('data[0] 非数组时返回空串单元素', () => {
+        const r = bg.parseBulkResponse({}, 1);
+        assert.deepEqual(r.translated, ['']);
+        assert.equal(r.matched, true);
+    });
+});
+
+await describe('buildNumberedPrompt [真源码 background.js]', async () => {
+    await it('生成 [n] 编号列表', () => {
+        assert.equal(bg.buildNumberedPrompt(['a', 'b', 'c']), '[1] a\n[2] b\n[3] c');
+    });
+    await it('单条', () => assert.equal(bg.buildNumberedPrompt(['只有一条']), '[1] 只有一条'));
+    await it('空数组返回空串', () => assert.equal(bg.buildNumberedPrompt([]), ''));
+});
+
+await describe('parseLLMReply [真源码 background.js — 5 个 LLM 引擎共用]', async () => {
+    const texts = ['Hello', 'World', 'Foo'];
+    await it('正常映射', () => {
+        const r = bg.parseLLMReply('[1] 你好\n[2] 世界\n[3] 福', texts);
+        assert.deepEqual(r, { Hello: '你好', World: '世界', Foo: '福' });
+    });
+    await it('乱序编号也能映射', () => {
+        const r = bg.parseLLMReply('[3] 福\n[1] 你好\n[2] 世界', texts);
+        assert.deepEqual(r, { Hello: '你好', World: '世界', Foo: '福' });
+    });
+    await it('缺号的条目保留原文', () => {
+        const r = bg.parseLLMReply('[1] 你好\n[3] 福', texts);
+        assert.equal(r.Hello, '你好');
+        assert.equal(r.World, 'World'); // 缺 [2]，保留原文
+        assert.equal(r.Foo, '福');
+    });
+    await it('越界编号被忽略不抛错', () => {
+        const r = bg.parseLLMReply('[1] 你好\n[9] 越界', texts);
+        assert.equal(r.Hello, '你好');
+        assert.equal(r.World, 'World');
+        assert.equal(r.Foo, 'Foo');
+    });
+    await it('空回包全部保留原文', () => {
+        const r = bg.parseLLMReply('', texts);
+        assert.deepEqual(r, { Hello: 'Hello', World: 'World', Foo: 'Foo' });
+    });
+    await it('构造↔解析 round-trip 对称', () => {
+        const src = ['Alpha', 'Beta'];
+        const prompt = bg.buildNumberedPrompt(src); // [1] Alpha\n[2] Beta
+        // 模拟 LLM 原样回显
+        const r = bg.parseLLMReply(prompt, src);
+        assert.deepEqual(r, { Alpha: 'Alpha', Beta: 'Beta' });
+    });
+});
+
+await describe('refineTranslation / buildCompiledGlossary [真源码 background.js, async]', async () => {
+    await it('buildCompiledGlossary 返回结构含短路正则', async () => {
+        const g = await bg.buildCompiledGlossary();
+        assert.ok(g.keywordMap instanceof Map);
+        assert.ok(Array.isArray(g.sortedBadWords));
+        assert.ok(g.keywordProbe instanceof RegExp);
+        assert.ok(g.badWordProbe instanceof RegExp);
+    });
+    await it('target 为空返回 source', async () => {
+        assert.equal(await bg.refineTranslation('anything', ''), 'anything');
+    });
+    await it('原文不含任何术语 → 短路返回原 target 不变', async () => {
+        assert.equal(await bg.refineTranslation('the quick brown fox', '敏捷的棕色狐狸'), '敏捷的棕色狐狸');
+    });
+    await it('命中内置术语 chatgpt → 校正 聊天GPT 为 ChatGPT', async () => {
+        const r = await bg.refineTranslation('I use ChatGPT daily', '我每天使用聊天GPT');
+        assert.equal(r, '我每天使用ChatGPT');
+    });
+    await it('短路②：原文含术语但译文不含待校正词 → target 原样', async () => {
+        const r = await bg.refineTranslation('I use ChatGPT', '我使用ChatGPT');
+        assert.equal(r, '我使用ChatGPT');
+    });
+});
+
+await describe('calculateChineseRatio [镜像：content.js 内联于 detectPageLanguage 未导出]', async () => {
+    await it('纯中文应返回 1', () => assert.equal(calculateChineseRatio('你好世界'), 1));
+    await it('纯英文应返回 0', () => assert.equal(calculateChineseRatio('Hello World'), 0));
+    await it('混合文本占比正确', () => { const r = calculateChineseRatio('你好Hello'); assert.ok(r > 0.28 && r < 0.29); });
+    await it('空文本返回 0', () => { assert.equal(calculateChineseRatio(''), 0); assert.equal(calculateChineseRatio(null), 0); });
+});
+
+await describe('shouldAutoTranslate [镜像：content.js 内联于 checkAutoTranslate 未导出]', async () => {
+    await it('网站偏好 never 始终不翻译', () => {
         assert.equal(shouldAutoTranslate('auto_all', 'never', false, false), false);
         assert.equal(shouldAutoTranslate('manual', 'never', false, false), false);
     });
-
-    it('网站偏好 auto 应始终翻译', () => {
+    await it('网站偏好 auto 始终翻译', () => {
         assert.equal(shouldAutoTranslate('manual', 'auto', false, false), true);
-        assert.equal(shouldAutoTranslate('whitelist', 'auto', false, false), true);
     });
-
-    it('auto_all 模式应翻译非排除域名', () => {
+    await it('auto_all 翻译非排除域名', () => {
         assert.equal(shouldAutoTranslate('auto_all', null, false, false), true);
         assert.equal(shouldAutoTranslate('auto_all', null, false, true), false);
     });
-
-    it('whitelist 模式应只翻译白名单域名', () => {
+    await it('whitelist 只翻白名单', () => {
         assert.equal(shouldAutoTranslate('whitelist', null, true, false), true);
         assert.equal(shouldAutoTranslate('whitelist', null, false, false), false);
     });
-
-    it('manual 模式应不自动翻译', () => {
-        assert.equal(shouldAutoTranslate('manual', null, false, false), false);
+    await it('manual 不自动翻译', () => {
         assert.equal(shouldAutoTranslate('manual', null, true, false), false);
     });
 });
 
-// ===== 输出结果 =====
-console.log('\n' + '='.repeat(50));
-console.log(`  测试完成: ${passedTests}/${totalTests} 通过`);
-if (failedTests > 0) {
-    console.log(`  失败: ${failedTests} 个`);
-    failures.forEach(f => console.log(`    - ${f.name}: ${f.error}`));
-    process.exit(1);
-} else {
-    console.log('  全部通过！');
-    process.exit(0);
 }
+
+// ===== 运行 + 输出 =====
+main().then(() => {
+    console.log('\n' + '='.repeat(50));
+    console.log(`  测试完成: ${passedTests}/${totalTests} 通过`);
+    if (failedTests > 0) {
+        console.log(`  失败: ${failedTests} 个`);
+        failures.forEach(f => console.log(`    - ${f.name}: ${f.error}`));
+        process.exit(1);
+    } else {
+        console.log('  全部通过！');
+        process.exit(0);
+    }
+}).catch(e => {
+    console.error('测试运行器异常:', e);
+    process.exit(1);
+});
