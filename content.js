@@ -118,6 +118,13 @@ function injectHoverTooltipStyles() {
         opacity: 1;
         transform: translateY(0);
       }
+      @media (prefers-color-scheme: dark) {
+        #yx-hover-tooltip {
+          background: #2d2e31;
+          border-color: #5f6368;
+          color: #e8eaed;
+        }
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
 }
@@ -336,6 +343,19 @@ function injectSelectionPopupStyles() {
         padding-top: 6px;
         border-top: 1px solid #eee;
       }
+      @media (prefers-color-scheme: dark) {
+        #yx-selection-popup {
+          background: #292a2d;
+          color: #e8eaed;
+          box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+        }
+        #yx-selection-popup .yx-popup-loading { color: #9aa0a6; }
+        #yx-selection-popup .yx-popup-divider { border-top-color: #3c4043; }
+        #yx-selection-popup .yx-popup-original {
+          color: #9aa0a6;
+          border-top-color: #3c4043;
+        }
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
 }
@@ -452,6 +472,20 @@ async function translateSelectedText(text) {
 
 // 监听选中事件
 function initSelectionTranslate() {
+    // 读取划词翻译开关；popup 修改后通过 onChanged 即时生效（无需刷新页面）
+    try {
+        chrome.storage.local.get(['selection_translate_enabled'], (r) => {
+            if (!chrome.runtime.lastError) {
+                selectionTranslateEnabled = r.selection_translate_enabled !== false;
+            }
+        });
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area === 'local' && changes.selection_translate_enabled) {
+                selectionTranslateEnabled = changes.selection_translate_enabled.newValue !== false;
+            }
+        });
+    } catch (e) { /* 读取失败保持默认开启 */ }
+
     document.addEventListener('mouseup', (e) => {
         // 忽略点击在气泡上的情况
         if (selectionPopup && selectionPopup.contains(e.target)) return;
@@ -461,6 +495,12 @@ function initSelectionTranslate() {
         }
 
         selectionPopupTimeout = setTimeout(() => {
+            // 用户关闭了划词翻译 → 不弹泡不发请求
+            if (!selectionTranslateEnabled) return;
+            // 敏感站（邮箱/网银/内网等）选中文本不自动外发第三方接口；
+            // 右键菜单"翻译选中文本"是显式操作，不受此限制
+            if (isSensitiveHost(window.location.hostname, window.location.protocol)) return;
+
             const selection = window.getSelection();
             const text = selection.toString().trim();
 
@@ -543,7 +583,16 @@ function injectToastStyles() {
         background: none;
         width: auto;
         height: auto;
-        color: #81c995; 
+        color: #81c995;
+        font-size: 16px;
+      }
+      .yx-toast-icon.error {
+        border: none;
+        animation: none;
+        background: none;
+        width: auto;
+        height: auto;
+        color: #f28b82;
         font-size: 16px;
       }
     `;
@@ -577,7 +626,7 @@ function showToast(message, type = 'loading') {
         msgDiv.appendChild(icon);
     } else if (type === 'error') {
         const icon = document.createElement('div');
-        icon.className = 'yx-toast-icon success';
+        icon.className = 'yx-toast-icon error';
         icon.textContent = '\u2715';
         msgDiv.appendChild(icon);
     } else {
@@ -684,6 +733,9 @@ const translateStats = { totalTranslated: 0, cacheHits: 0, apiCalls: 0 };
 
 // 双语对照模式
 let bilingualMode = false;
+
+// 划词翻译开关（popup 可关闭；默认开启）
+let selectionTranslateEnabled = true;
 
 // 当前翻译目标语言（用于检测语言切换）
 let currentTargetLang = null;
@@ -1151,7 +1203,7 @@ async function _doTranslation(root = document.body, touchedKeys = new Set()) {
         // 连续两批整批失败 → 熔断中止
         if (consecutiveFailedBatches >= 2) {
             if (isFullPage) hideProgressBar();
-            showToast('翻译遇到问题，部分内容可能未翻译', 'success');
+            showToast('翻译遇到问题，部分内容可能未翻译', 'error');
             break;
         }
     }
@@ -1508,6 +1560,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ status: 'ok' });
     } else if (request.type === 'GET_TRANSLATE_STATS') {
         sendResponse(translateStats);
+    } else if (request.type === 'GET_SITE_STATUS') {
+        // popup 用于显示"敏感站点，已禁用自动翻译"提示
+        sendResponse({ sensitive: isSensitiveHost(window.location.hostname, window.location.protocol) });
     }
 });
 

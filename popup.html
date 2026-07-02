@@ -390,6 +390,18 @@
       color: white;
     }
 
+    .site-pref-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .mode-hint {
+      font-size: 11px;
+      color: #9aa0a6;
+      margin-top: 6px;
+      line-height: 1.5;
+    }
+
     .shortcuts-hint {
       margin-top: 14px;
       padding-top: 10px;
@@ -397,6 +409,12 @@
       font-size: 11px;
       color: #9aa0a6;
       text-align: center;
+    }
+
+    .shortcuts-hint a {
+      color: #1a73e8;
+      text-decoration: none;
+      cursor: pointer;
     }
 
     /* 翻译引擎配置 */
@@ -599,6 +617,14 @@
         color: #5f6368;
       }
 
+      .shortcuts-hint a {
+        color: #8ab4f8;
+      }
+
+      .mode-hint {
+        color: #5f6368;
+      }
+
       .site-pref-info {
         color: #e8eaed;
       }
@@ -656,12 +682,22 @@
   <div class="lang-section">
     <div class="lang-row">
       <span>目标语言</span>
-      <select id="targetLangSelect" class="lang-select">
+      <select id="targetLangSelect" class="lang-select" aria-label="目标语言">
         <option value="zh-CN">简体中文</option>
         <option value="zh-TW">繁体中文</option>
         <option value="en">English</option>
         <option value="ja">日本語</option>
         <option value="ko">한국어</option>
+        <option value="fr">Français</option>
+        <option value="de">Deutsch</option>
+        <option value="es">Español</option>
+        <option value="ru">Русский</option>
+        <option value="pt">Português</option>
+        <option value="pt-BR">Português (Brasil)</option>
+        <option value="it">Italiano</option>
+        <option value="ar">العربية</option>
+        <option value="th">ไทย</option>
+        <option value="vi">Tiếng Việt</option>
       </select>
     </div>
   </div>
@@ -670,7 +706,7 @@
   <div class="engine-section">
     <div class="engine-row">
       <span>翻译引擎</span>
-      <select id="engineSelect" class="lang-select">
+      <select id="engineSelect" class="lang-select" aria-label="翻译引擎">
         <option value="google_free">Google翻译(免费)</option>
         <option value="google_cloud">Google Cloud</option>
         <option value="deepl">DeepL</option>
@@ -702,12 +738,13 @@
     <!-- 翻译模式选择 -->
     <div class="lang-row">
       <span>翻译模式</span>
-      <select id="translateModeSelect" class="lang-select">
+      <select id="translateModeSelect" class="lang-select" aria-label="翻译模式">
         <option value="auto_all">自动翻译所有外语</option>
-        <option value="whitelist">仅翻译白名单网站</option>
+        <option value="whitelist">仅翻译标「自动」的网站</option>
         <option value="manual">全部手动</option>
       </select>
     </div>
+    <div class="mode-hint" id="whitelistHint" style="display:none;">在下方「当前网站」点「自动」，即可把网站加入自动翻译名单</div>
     <!-- 当前网站偏好 -->
     <div class="site-pref-row" style="margin-top: 10px;">
       <div class="site-pref-info">
@@ -723,7 +760,14 @@
     <div class="switch-container" style="margin-top: 12px;">
       <span>双语对照模式</span>
       <label class="switch">
-        <input type="checkbox" id="bilingualToggle">
+        <input type="checkbox" id="bilingualToggle" aria-label="双语对照模式">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="switch-container" style="margin-top: 12px;">
+      <span>划词翻译</span>
+      <label class="switch">
+        <input type="checkbox" id="selectionToggle" aria-label="划词翻译">
         <span class="slider"></span>
       </label>
     </div>
@@ -731,7 +775,7 @@
 
   <!-- 翻译统计 -->
   <div class="stats-section">
-    <div class="stats-title">翻译统计</div>
+    <div class="stats-title">本页统计</div>
     <div class="stats-row"><span>已翻译</span><span id="statTotal">0 条</span></div>
     <div class="stats-row"><span>缓存命中</span><span id="statCache">0 次</span></div>
     <div class="stats-row"><span>API 调用</span><span id="statApi">0 次</span></div>
@@ -779,7 +823,7 @@
   </div>
 
   <div class="shortcuts-hint">
-    快捷键: Alt+T 翻译 | Alt+R 还原
+    快捷键: Alt+T 翻译 | Alt+R 还原 <a id="shortcutsEdit" href="#" title="打开 Chrome 快捷键设置页重新绑定">修改</a>
   </div>
 
   <script src="popup.js"></script>

@@ -50,6 +50,7 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 | `TRANSLATE_TEXT_BATCH` | content → background | 批量翻译请求 |
 | `TRANSLATE_COMPARE` | content → background | 划词翻译多引擎对比（当前引擎 + Google Free） |
 | `TRANSLATION_DONE` | content → background | 更新图标徽章 ✓ |
+| `GET_SITE_STATUS` | popup → content | 查询当前页是否敏感站（popup 显示"敏感站点 · 不自动翻译"并禁用「自动」按钮） |
 | `CACHE_GET_ALL` / `CACHE_PUT_BATCH` / `CACHE_CLEAR` / `CACHE_COUNT` | popup/content → background | IDB 缓存读写 |
 | `CACHE_TOUCH` | content → background | 命中缓存后批量更新 `lastAccess`（防活跃数据被 TTL 清掉） |
 | `GET_ENGINE_CONFIG` / `SAVE_ENGINE_CONFIG` | popup → background | **仅扩展页可调**，content script 调用会返回 `forbidden` |
@@ -128,6 +129,7 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 | `target_lang` | local | string | 经 `normalizeTargetLang` 校验 |
 | `api_keys` | local | object | **存 local 不存 sync**，避免上传 Google 账号 |
 | `bilingual_mode` | local | boolean | 双语对照 |
+| `selection_translate_enabled` | local | boolean | 划词翻译开关（默认 true；content 用 `storage.onChanged` 即时生效；敏感站 mouseup 划词强制不发，右键菜单显式翻译不受限） |
 | `user_glossary` | **sync** | `{keyword, badWord, goodWord}[]` | **会同步到 Google 账号**，隐私政策已声明 |
 | `auto_translate_enabled` / `excluded_domains` | local | — | **旧版**，仅 `onInstalled` 迁移用 |
 

@@ -76,9 +76,18 @@ const sitePrefNeverBtn = document.getElementById('sitePrefNeverBtn');
 const sitePrefClearBtn = document.getElementById('sitePrefClearBtn');
 const bilingualToggle = document.getElementById('bilingualToggle');
 let currentHostname = '';
+let siteIsSensitive = false; // 当前页是否敏感站（由 content 的 GET_SITE_STATUS 返回）
 
 // 更新网站偏好 UI 状态
 function updateSitePrefUI(pref) {
+    // 敏感站（邮箱/网银/内网等）自动翻译被强制禁用，明示用户这是保护不是故障
+    if (siteIsSensitive) {
+        sitePrefStatus.textContent = '敏感站点 · 不自动翻译';
+        sitePrefStatus.className = 'site-pref-status never';
+        sitePrefAutoBtn.disabled = true;
+        sitePrefAutoBtn.title = '敏感站点（邮箱/网银/内网等）为保护隐私不支持自动翻译，仍可手动翻译';
+        return;
+    }
     sitePrefStatus.textContent = pref === 'auto' ? '自动翻译'
         : pref === 'never' ? '从不翻译' : '跟随全局';
     sitePrefStatus.className = 'site-pref-status' + (pref ? ' ' + pref : '');
@@ -109,6 +118,17 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         const url = new URL(tabs[0].url);
         currentHostname = url.hostname;
 
+        // 询问 content script 当前页是否敏感站（失败静默忽略，如系统页面）
+        if (tabs[0].id) {
+            chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_SITE_STATUS' }, (resp) => {
+                if (chrome.runtime.lastError || !resp) return;
+                if (resp.sensitive) {
+                    siteIsSensitive = true;
+                    updateSitePrefUI(null);
+                }
+            });
+        }
+
         chrome.storage.local.get([
             'translate_mode', 'auto_translate_enabled',
             'site_preferences', 'bilingual_mode'
@@ -121,6 +141,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
             } else {
                 translateModeSelect.value = result.auto_translate_enabled === false ? 'manual' : 'auto_all';
             }
+            updateWhitelistHint();
 
             // 网站偏好
             const sitePrefs = result.site_preferences || {};
@@ -137,9 +158,16 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     }
 });
 
+// 白名单模式说明：告诉用户"白名单"就是下方标了「自动」的网站
+const whitelistHint = document.getElementById('whitelistHint');
+function updateWhitelistHint() {
+    whitelistHint.style.display = translateModeSelect.value === 'whitelist' ? 'block' : 'none';
+}
+
 // 翻译模式切换
 translateModeSelect.addEventListener('change', () => {
     chrome.storage.local.set({ translate_mode: translateModeSelect.value });
+    updateWhitelistHint();
 });
 
 // 网站偏好按钮
@@ -147,9 +175,29 @@ sitePrefAutoBtn.addEventListener('click', () => saveSitePreference('auto'));
 sitePrefNeverBtn.addEventListener('click', () => saveSitePreference('never'));
 sitePrefClearBtn.addEventListener('click', () => saveSitePreference(null));
 
-// 双语对照开关
+// 双语对照开关（改动只在下次翻译时生效，明示用户）
 bilingualToggle.addEventListener('change', () => {
     chrome.storage.local.set({ bilingual_mode: bilingualToggle.checked });
+    const statusDiv = document.getElementById('status');
+    statusDiv.textContent = '已保存，重新翻译后生效';
+    statusDiv.style.color = '#5f6368';
+    setTimeout(() => { statusDiv.textContent = '准备就绪'; }, 3000);
+});
+
+// 划词翻译开关（content script 监听 onChanged，即时生效）
+const selectionToggle = document.getElementById('selectionToggle');
+chrome.storage.local.get(['selection_translate_enabled'], (result) => {
+    if (chrome.runtime.lastError) return;
+    selectionToggle.checked = result.selection_translate_enabled !== false;
+});
+selectionToggle.addEventListener('change', () => {
+    chrome.storage.local.set({ selection_translate_enabled: selectionToggle.checked });
+});
+
+// 快捷键"修改"入口：popup 无法直接改绑定，跳 Chrome 快捷键设置页
+document.getElementById('shortcutsEdit').addEventListener('click', (e) => {
+    e.preventDefault();
+    chrome.tabs.create({ url: 'chrome://extensions/shortcuts' });
 });
 
 // ========== 翻译统计 ==========
@@ -288,6 +336,7 @@ function renderGlossaryList(list) {
         const delBtn = document.createElement('button');
         delBtn.className = 'del-btn';
         delBtn.textContent = '\u2715';
+        delBtn.setAttribute('aria-label', `\u5220\u9664\u672f\u8bed ${item.keyword}`);
         const sig = glossarySignature(item);
         delBtn.addEventListener('click', () => deleteGlossaryItemBySignature(sig));
         div.appendChild(span);

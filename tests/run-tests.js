@@ -483,6 +483,28 @@ await describe('引擎注册表派生等价 [真源码 background.js — 第5批
     });
 });
 
+await describe('popup 与 background 语言/引擎选项一致性 [静态解析 popup.html]', async () => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const html = fs.readFileSync(path.join(__dirname, '..', 'popup.html'), 'utf8');
+    // 抓每个 select 的 option value
+    const selectOptions = (id) => {
+        const m = html.match(new RegExp(`<select id="${id}"[\\s\\S]*?</select>`));
+        assert.ok(m, `popup.html 缺 <select id="${id}">`);
+        return [...m[0].matchAll(/<option value="([^"]+)"/g)].map(x => x[1]);
+    };
+    await it('目标语言下拉的每个 value 都在 ALLOWED_TARGET_LANGS 白名单内', () => {
+        const opts = selectOptions('targetLangSelect');
+        assert.ok(opts.length >= 15, `语言选项应 ≥15 个，实际 ${opts.length}`);
+        for (const v of opts) assert.ok(bg.ALLOWED_TARGET_LANGS.has(v), `popup 语言 ${v} 不在白名单`);
+    });
+    await it('引擎下拉的每个 value 都在 ALLOWED_ENGINES 白名单内且数量一致', () => {
+        const opts = selectOptions('engineSelect');
+        for (const v of opts) assert.ok(bg.ALLOWED_ENGINES.has(v), `popup 引擎 ${v} 不在白名单`);
+        assert.equal(opts.length, bg.ALLOWED_ENGINES.size, 'popup 引擎数量与白名单不一致');
+    });
+});
+
 }
 
 // ===== 运行 + 输出 =====
