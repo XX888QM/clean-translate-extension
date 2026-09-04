@@ -7,6 +7,7 @@
 //      源码用 __TEST__ / typeof module 守卫，在 Node 下跳过 DOM 初始化副作用、导出纯函数。
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 
 // ===== 测试运行器（支持 async 测试）=====
 let totalTests = 0;
@@ -112,11 +113,11 @@ function shouldAutoTranslate(mode, sitePref, isInWhitelist, isInExcludeList, isS
     if (sitePref === 'never') return false;
     if (isSensitive) return false;
     if (sitePref === 'auto') return true;
-    switch (mode) {
+    switch (ct.resolveTranslateMode(mode)) {
         case 'auto_all': return !isInExcludeList;
         case 'whitelist': return isInWhitelist;
         case 'manual': return false;
-        default: return true;
+        default: return false;
     }
 }
 // LRU 容量淘汰镜像：真源码 MAX_CACHE_SIZE=10000，端到端测淘汰需插万级条目，故用小容量镜像验证淘汰逻辑
@@ -224,6 +225,73 @@ await describe('normalizeTargetLang / normalizeEngine [真源码 background.js]'
         assert.equal(bg.normalizeEngine('__proto__'), 'google_free');
         assert.equal(bg.normalizeEngine(null), 'google_free');
         assert.equal(bg.normalizeEngine(42), 'google_free');
+    });
+});
+
+await describe('安全边界 [真源码 background.js / content.js]', async () => {
+    await it('手动翻译不得暗中开启当前网站自动翻译', () => {
+        const popupSource = fs.readFileSync(require.resolve('../popup.js'), 'utf8');
+        const contentSource = fs.readFileSync(require.resolve('../content.js'), 'utf8');
+        assert.equal(popupSource.includes('recordPreference'), false);
+        assert.equal(contentSource.includes('request.recordPreference'), false);
+    });
+
+    await it('缺少或脏翻译模式默认 manual，明确旧偏好仍保留', () => {
+        for (const resolve of [bg.resolveTranslateMode, ct.resolveTranslateMode]) {
+            assert.equal(resolve(undefined, undefined), 'manual');
+            assert.equal(resolve('evil', undefined), 'manual');
+            assert.equal(resolve(undefined, false), 'manual');
+            assert.equal(resolve(undefined, true), 'auto_all');
+            assert.equal(resolve('auto_all', false), 'auto_all');
+            assert.equal(resolve('whitelist', undefined), 'whitelist');
+        }
+    });
+
+    await it('批量翻译拒绝非法、超长和超总量输入', () => {
+        assert.deepEqual(bg.validateTranslationTexts(['hello']), { texts: ['hello'], totalChars: 5 });
+        assert.throws(() => bg.validateTranslationTexts('hello'));
+        assert.throws(() => bg.validateTranslationTexts([]));
+        assert.throws(() => bg.validateTranslationTexts(['ok', 1]));
+        assert.throws(() => bg.validateTranslationTexts(['x'.repeat(1501)]));
+        assert.throws(() => bg.validateTranslationTexts(Array(14).fill('x'.repeat(1500))));
+        assert.throws(() => bg.validateTranslationTexts(Array(201).fill('ok')));
+    });
+
+    await it('content 按条数和总字符组包，并跳过超长单条', () => {
+        const chunks = ct.chunkTranslationTexts([
+            ...Array(14).fill('x'.repeat(1500)),
+            'y'.repeat(1501),
+            'tail',
+        ]);
+        assert.equal(chunks.flat().includes('y'.repeat(1501)), false);
+        assert.equal(chunks.flat().at(-1), 'tail');
+        for (const chunk of chunks) {
+            assert.ok(chunk.length <= 200);
+            assert.ok(chunk.reduce((sum, text) => sum + text.length, 0) <= 20000);
+        }
+    });
+
+    await it('划词只接受可信用户事件', () => {
+        assert.equal(ct.shouldHandleSelectionMouseup({ isTrusted: false }, true, false), false);
+        assert.equal(ct.shouldHandleSelectionMouseup({ isTrusted: true }, false, false), false);
+        assert.equal(ct.shouldHandleSelectionMouseup({ isTrusted: true }, true, true), false);
+        assert.equal(ct.shouldHandleSelectionMouseup({ isTrusted: true }, true, false), true);
+    });
+
+    await it('后台每标签页预算限制请求并在时间窗后恢复', () => {
+        bg.resetTranslationRequestBudgets();
+        for (let i = 0; i < 60; i++) {
+            assert.equal(bg.consumeTranslationRequestBudget(7, 500, 1000), true);
+        }
+        assert.equal(bg.consumeTranslationRequestBudget(7, 1, 1000), false);
+        assert.equal(bg.consumeTranslationRequestBudget(7, 500, 61000), true);
+    });
+
+    await it('动态翻译字符预算限制持续 DOM 更新并在时间窗后恢复', () => {
+        ct.resetDynamicTranslationBudget();
+        assert.equal(ct.consumeDynamicTranslationBudget(50000, 1000), true);
+        assert.equal(ct.consumeDynamicTranslationBudget(1, 1000), false);
+        assert.equal(ct.consumeDynamicTranslationBudget(50000, 61000), true);
     });
 });
 

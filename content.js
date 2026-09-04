@@ -4,6 +4,11 @@ const __TEST__ = (typeof module !== 'undefined' && module.exports);
 // 基础配置
 const MIN_TEXT_LENGTH = 2;
 const MAX_CACHE_SIZE = 10000; // 缓存最大条目数（约占用 3-5MB 存储空间）
+const MAX_TRANSLATION_TEXT_CHARS = 1500;
+const MAX_TRANSLATION_BATCH_ITEMS = 200;
+const MAX_TRANSLATION_BATCH_CHARS = 20000;
+const DYNAMIC_TRANSLATION_BUDGET_WINDOW_MS = 60 * 1000;
+const MAX_DYNAMIC_TRANSLATION_CHARS_PER_WINDOW = 50000;
 
 // 可翻译的 HTML 属性列表
 const TRANSLATABLE_ATTRS = ['placeholder', 'title', 'alt', 'aria-label'];
@@ -240,7 +245,7 @@ function createViewportObserver() {
                 const el = entry.target;
                 // 进入视口时翻译该元素
                 viewportObserver.unobserve(el);
-                performTranslation(el);
+                performTranslation(el, true);
             }
         });
     }, {
@@ -256,7 +261,7 @@ function performViewportTranslation(nodes) {
     const obs = createViewportObserver();
     if (!obs) {
         // 不支持 IntersectionObserver 时回退到直接翻译
-        nodes.forEach(node => performTranslation(node));
+        nodes.forEach(node => performTranslation(node, true));
         return;
     }
 
@@ -274,7 +279,7 @@ function performViewportTranslation(nodes) {
             obs.observe(node);
         } else {
             // 行内元素直接翻译（通常体积小）
-            performTranslation(node);
+            performTranslation(node, true);
         }
     });
 }
@@ -487,6 +492,11 @@ function initSelectionTranslate() {
     } catch (e) { /* 读取失败保持默认开启 */ }
 
     document.addEventListener('mouseup', (e) => {
+        if (!shouldHandleSelectionMouseup(
+            e,
+            selectionTranslateEnabled,
+            isSensitiveHost(window.location.hostname, window.location.protocol)
+        )) return;
         // 忽略点击在气泡上的情况
         if (selectionPopup && selectionPopup.contains(e.target)) return;
 
@@ -495,12 +505,6 @@ function initSelectionTranslate() {
         }
 
         selectionPopupTimeout = setTimeout(() => {
-            // 用户关闭了划词翻译 → 不弹泡不发请求
-            if (!selectionTranslateEnabled) return;
-            // 敏感站（邮箱/网银/内网等）选中文本不自动外发第三方接口；
-            // 右键菜单"翻译选中文本"是显式操作，不受此限制
-            if (isSensitiveHost(window.location.hostname, window.location.protocol)) return;
-
             const selection = window.getSelection();
             const text = selection.toString().trim();
 
@@ -684,9 +688,58 @@ let observer = null;
 let mutationDebounceTimer = null; // 防抖计时器
 let cacheSaveTimer = null; // 缓存保存防抖计时器
 let pendingCacheUpdates = {}; // 待保存的缓存更新
+let dynamicTranslationBudgetStartedAt = 0;
+let dynamicTranslationBudgetChars = 0;
 const originalTextMap = new WeakMap(); // 存储原文: Node -> String
 const translationCache = new Map();    // 内存缓存: String -> String（使用 LRU 策略）
 const MAX_PENDING_NODES = 100; // MutationObserver 最大待处理节点数
+
+function resolveTranslateMode(mode, legacyEnabled) {
+    if (mode === 'auto_all' || mode === 'whitelist' || mode === 'manual') return mode;
+    return legacyEnabled === true ? 'auto_all' : 'manual';
+}
+
+function shouldHandleSelectionMouseup(event, enabled, sensitive) {
+    return event?.isTrusted === true && enabled === true && sensitive === false;
+}
+
+function resetDynamicTranslationBudget() {
+    dynamicTranslationBudgetStartedAt = 0;
+    dynamicTranslationBudgetChars = 0;
+}
+
+function consumeDynamicTranslationBudget(chars, now = Date.now()) {
+    if (!Number.isFinite(chars) || chars < 0) return false;
+    if (!dynamicTranslationBudgetStartedAt ||
+        now - dynamicTranslationBudgetStartedAt >= DYNAMIC_TRANSLATION_BUDGET_WINDOW_MS) {
+        dynamicTranslationBudgetStartedAt = now;
+        dynamicTranslationBudgetChars = 0;
+    }
+    if (dynamicTranslationBudgetChars + chars > MAX_DYNAMIC_TRANSLATION_CHARS_PER_WINDOW) {
+        return false;
+    }
+    dynamicTranslationBudgetChars += chars;
+    return true;
+}
+
+function chunkTranslationTexts(texts) {
+    const chunks = [];
+    let chunk = [];
+    let chars = 0;
+    for (const text of texts) {
+        if (typeof text !== 'string' || !text.trim() || text.length > MAX_TRANSLATION_TEXT_CHARS) continue;
+        if (chunk.length >= MAX_TRANSLATION_BATCH_ITEMS ||
+            (chunk.length > 0 && chars + text.length > MAX_TRANSLATION_BATCH_CHARS)) {
+            chunks.push(chunk);
+            chunk = [];
+            chars = 0;
+        }
+        chunk.push(text);
+        chars += text.length;
+    }
+    if (chunk.length > 0) chunks.push(chunk);
+    return chunks;
+}
 
 // 翻译 document.title
 let originalTitle = null;
@@ -916,6 +969,7 @@ function restoreOriginal() {
         viewportObserver.disconnect();
         viewportObserver = null;
     }
+    resetDynamicTranslationBudget();
 
     const nodes = getTextNodes();
     let count = 0;
@@ -949,7 +1003,7 @@ function restoreOriginal() {
     showToast('已还原原文', 'restore');
 }
 
-async function performTranslation(root = document.body) {
+async function performTranslation(root = document.body, isDynamic = false) {
     // 防止并发执行（但允许子树翻译）
     if (isTranslating && root === document.body) {
         console.log('YX翻译: 翻译正在进行中，跳过重复请求');
@@ -963,7 +1017,7 @@ async function performTranslation(root = document.body) {
     // 每次翻译用独立的命中 key 集合：多条翻译链（整页 + 视口子树）并发时互不清空
     const touchedKeys = new Set();
     try {
-        await _doTranslation(root, touchedKeys);
+        await _doTranslation(root, touchedKeys, isDynamic);
     } finally {
         if (root === document.body) {
             isTranslating = false;
@@ -982,7 +1036,7 @@ function flushCacheTouches(keysSet) {
         .catch(() => { /* 忽略 touch 失败 */ });
 }
 
-async function _doTranslation(root = document.body, touchedKeys = new Set()) {
+async function _doTranslation(root = document.body, touchedKeys = new Set(), isDynamic = false) {
     // 记录本次翻译代际（在任何 await 之前捕获）：还原/切语言会自增代际，
     // 后续每个回写点（含缓存命中同步回写、异步 chunk 回写）比对代际，不符即丢弃，
     // 防止在 storage 读取 / 缓存加载等 await 间隙被还原后，stale 结果又覆盖已还原的 DOM
@@ -1112,12 +1166,18 @@ async function _doTranslation(root = document.body, touchedKeys = new Set()) {
         });
     }
 
-    const textsToTranslate = Array.from(missingTranslations);
+    const chunks = chunkTranslationTexts(Array.from(missingTranslations));
+    const textsToTranslate = chunks.flat();
     if (textsToTranslate.length === 0) {
         isTranslated = true;
         // 全部命中缓存的情况：仍需 flush 已收集的命中 key，否则 lastAccess 永不更新
         flushCacheTouches(touchedKeys);
         return;
+    }
+
+    if (isDynamic) {
+        const dynamicChars = textsToTranslate.reduce((sum, text) => sum + text.length, 0);
+        if (!consumeDynamicTranslationBudget(dynamicChars)) return;
     }
 
     const totalCount = textsToTranslate.length;
@@ -1130,17 +1190,9 @@ async function _doTranslation(root = document.body, touchedKeys = new Set()) {
         showToast(`翻译中 0/${totalCount}...`, 'loading');
     }
 
-    // 分块大小（后台已支持合并翻译，可以发更大的 chunk）
-    const CHUNK_SIZE = 200;
     const MAX_CONCURRENT = 3; // 最多同时发送 3 个 chunk
     let translatedCount = 0;
     let consecutiveFailedBatches = 0; // 连续"整批全失败"的批次数，用于熔断
-
-    // 构建所有 chunk
-    const chunks = [];
-    for (let i = 0; i < textsToTranslate.length; i += CHUNK_SIZE) {
-        chunks.push(textsToTranslate.slice(i, i + CHUNK_SIZE));
-    }
 
     // 并发发送 chunk（限制并发数）
     for (let i = 0; i < chunks.length; i += MAX_CONCURRENT) {
@@ -1357,6 +1409,7 @@ function triggerAutoTranslate(targetLang) {
     const detectedLang = detectPageLanguage(targetLang);
     if (detectedLang !== 'target') {
         autoTranslateTriggered = true;
+        resetDynamicTranslationBudget();
         console.log('YX翻译: 检测到外语内容，开始翻译...');
         showToast('正在自动为您翻译...', 'loading');
 
@@ -1444,8 +1497,7 @@ function checkAutoTranslate() {
             }
 
             // 3. 根据翻译模式决定（兼容旧版 auto_translate_enabled）
-            const mode = result.translate_mode ||
-                (result.auto_translate_enabled === false ? 'manual' : 'auto_all');
+            const mode = resolveTranslateMode(result.translate_mode, result.auto_translate_enabled);
 
             switch (mode) {
                 case 'auto_all': {
@@ -1518,18 +1570,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (!chrome.runtime?.id) return;
 
     if (request.type === 'START_TRANSLATE') {
-        // 记录网站翻译偏好（手动点击翻译时）；但敏感站点（邮箱/网银/内网等）不静默记为"自动"，
-        // 避免一次手动翻译把敏感域名变成长期自动外发（隐私默认更硬，仍可手动逐次翻译）
-        if (request.recordPreference) {
-            const host = window.location.hostname;
-            if (host && !isSensitiveHost(host, window.location.protocol)) {
-                chrome.storage.local.get(['site_preferences'], (result) => {
-                    if (chrome.runtime.lastError) return;
-                    const prefs = { ...(result.site_preferences || {}), [host]: 'auto' };
-                    chrome.storage.local.set({ site_preferences: prefs });
-                });
-            }
-        }
+        resetDynamicTranslationBudget();
         showToast('开始分析页面...', 'loading');
         performTranslation()
             .then(() => {
@@ -1551,11 +1592,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ status: 'restored' });
     } else if (request.type === 'TRANSLATE_SELECTION') {
         // 右键菜单触发的选中文本翻译
+        const text = typeof request.text === 'string' ? request.text.trim() : '';
         const selection = window.getSelection();
-        if (selection.rangeCount > 0) {
+        if (text.length >= 2 && text.length <= 500 && selection.rangeCount > 0) {
             const range = selection.getRangeAt(0);
             const rect = range.getBoundingClientRect();
-            showSelectionPopup(request.text, rect.left + window.scrollX, rect.bottom + window.scrollY);
+            showSelectionPopup(text, rect.left + window.scrollX, rect.bottom + window.scrollY);
         }
         sendResponse({ status: 'ok' });
     } else if (request.type === 'GET_TRANSLATE_STATS') {
@@ -1575,5 +1617,10 @@ if (__TEST__) {
         cacheSet,
         translationCache,
         MAX_CACHE_SIZE,
+        resolveTranslateMode,
+        shouldHandleSelectionMouseup,
+        chunkTranslationTexts,
+        consumeDynamicTranslationBudget,
+        resetDynamicTranslationBudget,
     };
 }

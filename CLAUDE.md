@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-YX 纯净网页翻译（v1.5.1）— Chrome Manifest V3 扩展，把网页内容翻译为目标语言。**核心思想**：用 `TreeWalker` 遍历 DOM 文本节点逐节点替换 `nodeValue`，而非替换 `innerHTML`，避免破坏 React/Vue/SPA 框架的组件状态与事件绑定。
+YX 纯净网页翻译（v1.5.4）— Chrome Manifest V3 扩展，把网页内容翻译为目标语言。**核心思想**：用 `TreeWalker` 遍历 DOM 文本节点逐节点替换 `nodeValue`，而非替换 `innerHTML`，避免破坏 React/Vue/SPA 框架的组件状态与事件绑定。
 
 ## 开发命令
 
@@ -44,7 +44,7 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 
 | 类型 | 方向 | 说明 |
 |---|---|---|
-| `START_TRANSLATE` | popup/background → content | 触发整页翻译（可带 `recordPreference: true` 自动记 'auto' 偏好） |
+| `START_TRANSLATE` | popup/background → content | 触发当前页翻译；不改变网站自动翻译偏好 |
 | `RESTORE_ORIGINAL` | popup/background → content | 还原原文 |
 | `TRANSLATE_SELECTION` | background → content | 右键菜单划词翻译 |
 | `TRANSLATE_TEXT_BATCH` | content → background | 批量翻译请求 |
@@ -62,6 +62,7 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 3. **`normalizeTargetLang` / `normalizeEngine`**：`background.js` 顶部定义白名单。从 `chrome.storage.local` 读出来的 `target_lang` / `translate_engine` 必须经过 normalize 才能用，防止脏数据进 URL 或 LLM prompt。
 4. **API 错误净化**：4xx/5xx 响应**不透传 body**，只保留 status，避免 key 片段 / 请求摘要泄漏。
 5. **performTranslation `.catch()` 兜底**：`content.js` 里两处调用点（`triggerAutoTranslate` 和 `START_TRANSLATE` 处理）都必须有 catch：失败时 `hideProgressBar()` + `showToast('翻译失败','error')` + `isTranslating = false` + `autoTranslateTriggered = false`。
+6. **不可信页面输入限额**：`TRANSLATE_TEXT_BATCH` / `TRANSLATE_COMPARE` 必须校验 content sender、单条/单批大小和每标签页时间窗预算；自动划词必须要求 `event.isTrusted`；MutationObserver 子树翻译受动态字符预算限制。
 
 ## background.js（Service Worker）
 
@@ -106,7 +107,7 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
   - `recordTranslatedAttrElement()` 用 WeakSet 查重，避免同元素重复 push
   - 超过 `TRANSLATED_ATTR_REFS_COMPACT_THRESHOLD = 5000` 时调 `compactTranslatedAttrRefs()` 清失效引用
   - 还原原文 / 语言切换调 `resetTranslatedAttrTracker()` 同时重建 WeakSet（注意：函数体是 `translatedAttrRefs.length = 0; translatedAttrElementSet = new WeakSet();`，不要写成自调用）
-- **MutationObserver**：监听 `document.body subtree:true`，200ms 防抖，`pendingNodes` 集合上限 `MAX_PENDING_NODES = 100`
+- **MutationObserver**：监听 `document.body subtree:true`，200ms 防抖，`pendingNodes` 集合上限 `MAX_PENDING_NODES = 100`，动态缺失文本每分钟最多 50,000 字符
 - **IntersectionObserver**：rootMargin 200px 视口预加载翻译
 - **悬停显示原文**：事件委托 + 1 秒延迟
 - **划词翻译多引擎对比**：发 `TRANSLATE_COMPARE` 消息，气泡同时显示当前引擎和 Google Free 结果
@@ -114,7 +115,7 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 
 ## popup.js（扩展页 UI）
 
-- **翻译/还原**：手动翻译用 `recordPreference: true` 让 content 自动记录 'auto' 偏好
+- **翻译/还原**：手动翻译只作用于当前页；单站自动翻译必须由用户点“自动”按钮开启
 - **自定义术语删除**：用 `glossarySignature(item)` = `${keyword}${badWord}${goodWord}` 作为稳定签名，`deleteGlossaryItemBySignature(sig)` 按签名 filter 删除，**不要回到 `splice(index, 1)`**（连点删错条目）
 - **API Key 管理**：根据引擎动态显示输入面板。新增引擎需同时改 `ENGINE_HINTS` 和 `ENGINE_KEY_MAP`
 
@@ -122,7 +123,7 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 
 | 键 | 区域 | 类型 | 说明 |
 |---|---|---|---|
-| `translate_mode` | local | `'auto_all' \| 'whitelist' \| 'manual'` | 翻译模式（默认 `auto_all`） |
+| `translate_mode` | local | `'auto_all' \| 'whitelist' \| 'manual'` | 翻译模式（新安装默认 `manual`） |
 | `whitelist_domains` | local | string[] | whitelist 模式使用 |
 | `site_preferences` | local | `{ [domain]: 'auto' \| 'never' }` | 优先级高于 mode |
 | `translate_engine` | local | string | 经 `normalizeEngine` 校验 |
@@ -148,6 +149,9 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 | `MAX_PENDING_NODES` | content.js | 100 | MutationObserver 待处理上限 |
 | `MIN_TEXT_LENGTH` | content.js | 2 | 可翻译最小字符数 |
 | `TRANSLATED_ATTR_REFS_COMPACT_THRESHOLD` | content.js | 5000 | WeakRef 数组压缩阈值 |
+| `MAX_TRANSLATION_TEXT_CHARS` | background.js / content.js | 1500 | 单条页面文本硬上限 |
+| `MAX_TRANSLATION_BATCH_CHARS` | background.js / content.js | 20000 | 单批消息总字符上限 |
+| `MAX_DYNAMIC_TRANSLATION_CHARS_PER_WINDOW` | content.js | 50000/分钟 | SPA 动态文本翻译预算 |
 
 ## 添加新翻译引擎的清单
 

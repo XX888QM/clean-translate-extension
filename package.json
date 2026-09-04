@@ -1,6 +1,6 @@
 {
   "name": "yx-clean-translate",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "YX 纯净网页翻译 Chrome 扩展 —— 仅用于开发/测试；扩展运行时零依赖、无构建步骤",
   "private": true,
   "scripts": {

@@ -45,9 +45,9 @@ function sendMessageToTab(message) {
     });
 }
 
-// 翻译/还原按钮（手动翻译时记录网站偏好）
+// 翻译/还原按钮
 document.getElementById('translateBtn').addEventListener('click', () => {
-    sendMessageToTab({ type: 'START_TRANSLATE', recordPreference: true });
+    sendMessageToTab({ type: 'START_TRANSLATE' });
 });
 
 document.getElementById('restoreBtn').addEventListener('click', () => {
@@ -137,9 +137,10 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
 
             // 翻译模式（兼容旧版）
             if (result.translate_mode) {
-                translateModeSelect.value = result.translate_mode;
+                translateModeSelect.value = ['auto_all', 'whitelist', 'manual'].includes(result.translate_mode)
+                    ? result.translate_mode : 'manual';
             } else {
-                translateModeSelect.value = result.auto_translate_enabled === false ? 'manual' : 'auto_all';
+                translateModeSelect.value = result.auto_translate_enabled === true ? 'auto_all' : 'manual';
             }
             updateWhitelistHint();
 

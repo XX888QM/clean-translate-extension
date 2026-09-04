@@ -10,6 +10,15 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 天未访问就清掉
 const CACHE_MAX_BYTES = 50 * 1024 * 1024;      // 硬上限 50MB
 const CACHE_CLEANUP_ALARM = 'yx-cache-cleanup';
 
+// 页面文本属于不可信输入：同时限制单条、单批和每标签页时间窗预算
+const MAX_TRANSLATION_TEXT_CHARS = 1500;
+const MAX_TRANSLATION_BATCH_ITEMS = 200;
+const MAX_TRANSLATION_BATCH_CHARS = 20000;
+const TRANSLATION_REQUEST_WINDOW_MS = 60 * 1000;
+const MAX_TRANSLATION_REQUEST_UNITS_PER_WINDOW = 60;
+const MAX_TRANSLATION_CHARS_PER_WINDOW = 250000;
+const translationRequestBudgets = new Map();
+
 // IndexedDB 不可用降级标志：隐私模式 / 配额耗尽 / 被企业策略禁用时 IDB 打不开，
 // 置位后缓存操作直接快速失败，避免每次翻译都反复 openDB 失败刷错误日志
 let idbUnavailable = false;
@@ -256,12 +265,65 @@ function stopKeepAlive() {
     }
 }
 
+function resolveTranslateMode(mode, legacyEnabled) {
+  if (mode === 'auto_all' || mode === 'whitelist' || mode === 'manual') return mode;
+  return legacyEnabled === true ? 'auto_all' : 'manual';
+}
+
+function validateTranslationTexts(texts, maxItems = MAX_TRANSLATION_BATCH_ITEMS,
+  maxTextChars = MAX_TRANSLATION_TEXT_CHARS, maxTotalChars = MAX_TRANSLATION_BATCH_CHARS) {
+  if (!Array.isArray(texts) || texts.length === 0 || texts.length > maxItems) {
+    throw new Error('invalid translation request');
+  }
+  let totalChars = 0;
+  for (const text of texts) {
+    if (typeof text !== 'string' || !text.trim() || text.length > maxTextChars) {
+      throw new Error('invalid translation request');
+    }
+    totalChars += text.length;
+    if (totalChars > maxTotalChars) throw new Error('invalid translation request');
+  }
+  return { texts, totalChars };
+}
+
+function requireContentTab(sender) {
+  if (sender?.id !== chrome.runtime.id || !Number.isInteger(sender?.tab?.id)) {
+    throw new Error('forbidden');
+  }
+  return sender.tab.id;
+}
+
+function consumeTranslationRequestBudget(tabId, totalChars, now = Date.now(), requestUnits) {
+  const units = requestUnits ?? 1;
+  let budget = translationRequestBudgets.get(tabId);
+  if (!budget || now - budget.startedAt >= TRANSLATION_REQUEST_WINDOW_MS) {
+    budget = { startedAt: now, units: 0, chars: 0 };
+  }
+  if (budget.units + units > MAX_TRANSLATION_REQUEST_UNITS_PER_WINDOW ||
+      budget.chars + totalChars > MAX_TRANSLATION_CHARS_PER_WINDOW) {
+    return false;
+  }
+  budget.units += units;
+  budget.chars += totalChars;
+  translationRequestBudgets.set(tabId, budget);
+  return true;
+}
+
+function resetTranslationRequestBudgets() {
+  translationRequestBudgets.clear();
+}
+
 // 消息监听（统一处理所有消息类型）
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'TRANSLATE_TEXT_BATCH') {
     (async () => {
       try {
-        const results = await handleBatchTranslation(request.texts);
+        const tabId = requireContentTab(sender);
+        const validated = validateTranslationTexts(request.texts);
+        if (!consumeTranslationRequestBudget(tabId, validated.totalChars)) {
+          throw new Error('translation rate limit exceeded');
+        }
+        const results = await handleBatchTranslation(validated.texts);
         sendResponse({ success: true, results });
       } catch (error) {
         console.error("批量翻译失败:", error);
@@ -318,11 +380,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 15000);
       try {
-        const text = request.text;
+        const tabId = requireContentTab(sender);
+        const validated = validateTranslationTexts([request.text], 1, 500, 500);
+        const text = validated.texts[0];
         const settings = await chrome.storage.local.get(['target_lang', 'translate_engine', 'api_keys']);
         const targetLang = normalizeTargetLang(settings.target_lang);
         const engine = normalizeEngine(settings.translate_engine);
         const apiKeys = (settings.api_keys && typeof settings.api_keys === 'object') ? settings.api_keys : {};
+        if (!consumeTranslationRequestBudget(tabId, validated.totalChars, Date.now(), engine === 'google_free' ? 1 : 2)) {
+          throw new Error('translation rate limit exceeded');
+        }
 
         const results = {};
 
@@ -419,6 +486,10 @@ chrome.commands.onCommand.addListener(async (command) => {
 
 // 右键菜单
 chrome.runtime.onInstalled.addListener(async (details) => {
+  resetTranslationRequestBudgets();
+  if (details.reason === 'install') {
+    await chrome.storage.local.set({ translate_mode: 'manual' });
+  }
   // 从旧版 chrome.storage.local 迁移缓存到 IndexedDB
   if (details.reason === 'update') {
     try {
@@ -435,8 +506,10 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     // 迁移旧版设置到新版翻译模式
     try {
       const settings = await chrome.storage.local.get(['auto_translate_enabled', 'excluded_domains', 'translate_mode']);
-      if (!settings.translate_mode && settings.auto_translate_enabled === false) {
-        chrome.storage.local.set({ translate_mode: 'manual' });
+      if (!settings.translate_mode) {
+        chrome.storage.local.set({
+          translate_mode: resolveTranslateMode(undefined, settings.auto_translate_enabled)
+        });
       }
       // 迁移 excluded_domains 到 site_preferences
       if (settings.excluded_domains && settings.excluded_domains.length > 0) {
@@ -573,6 +646,7 @@ function normalizeEngine(raw) {
 }
 
 async function _handleBatchTranslation(texts) {
+  texts = validateTranslationTexts(texts).texts;
   // 一次性读取目标语言和引擎设置
   let targetLang = 'zh-CN';
   let engine = 'google_free';
@@ -585,7 +659,7 @@ async function _handleBatchTranslation(texts) {
   } catch (e) { /* 使用默认值 */ }
 
   // 将文本按字符总量分组，每组合并为一次 API 请求
-  const MAX_BULK_CHARS = 1500; // 单次请求最大原文字符数
+  const MAX_BULK_CHARS = MAX_TRANSLATION_TEXT_CHARS; // 单次请求最大原文字符数
   const bulkGroups = [];
   let currentGroup = [];
   let currentLen = 0;
@@ -2296,5 +2370,9 @@ if (typeof module !== 'undefined' && module.exports) {
     ENGINE_REGISTRY,
     ALLOWED_ENGINES,
     ENGINE_NAMES,
+    resolveTranslateMode,
+    validateTranslationTexts,
+    consumeTranslationRequestBudget,
+    resetTranslationRequestBudgets,
   };
 }
