@@ -61,6 +61,7 @@ function showProgressBar() {
     if (!bar) {
         bar = document.createElement('div');
         bar.id = 'yx-progress-bar';
+        bar.dataset.yxUi = '';
         document.body.appendChild(bar);
     }
     bar.classList.remove('yx-progress-done');
@@ -141,6 +142,7 @@ function showOriginalTooltip(text, x, y) {
     if (!hoverTooltip) {
         hoverTooltip = document.createElement('div');
         hoverTooltip.id = 'yx-hover-tooltip';
+        hoverTooltip.dataset.yxUi = '';
         document.body.appendChild(hoverTooltip);
     }
 
@@ -292,13 +294,17 @@ function injectSelectionPopupStyles() {
     style.id = 'yx-selection-popup-style';
     style.textContent = `
       #yx-selection-popup {
-        position: absolute;
+        position: fixed;
         z-index: 2147483647;
         background: #fff;
         border-radius: 8px;
         box-shadow: 0 4px 16px rgba(0,0,0,0.15);
         padding: 10px 14px;
         max-width: 400px;
+        box-sizing: border-box;
+        width: min(400px, calc(100vw - 24px));
+        max-height: calc(100vh - 24px);
+        overflow-y: auto;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         font-size: 14px;
         line-height: 1.5;
@@ -313,6 +319,7 @@ function injectSelectionPopupStyles() {
         transform: translateY(0);
         pointer-events: auto;
       }
+      #yx-selection-popup[hidden] { display: none; }
       #yx-selection-popup .yx-popup-loading {
         display: flex;
         align-items: center;
@@ -331,6 +338,18 @@ function injectSelectionPopupStyles() {
       #yx-selection-popup .yx-popup-result {
         word-break: break-word;
       }
+      #yx-selection-popup button {
+        border: 1px solid #dadce0;
+        border-radius: 5px;
+        padding: 3px 8px;
+        margin: 6px 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      #yx-selection-popup button:focus-visible { outline: 2px solid #1a73e8; }
       #yx-selection-popup .yx-popup-engine-label {
         font-size: 11px;
         color: #1a73e8;
@@ -368,6 +387,17 @@ function injectSelectionPopupStyles() {
 // 划词翻译气泡
 let selectionPopup = null;
 let selectionPopupTimeout = null;
+let selectionRequestId = 0;
+let selectionAnchor = { x: 12, y: 12 };
+
+function positionSelectionPopup() {
+    if (!selectionPopup) return;
+    const rect = selectionPopup.getBoundingClientRect();
+    const left = Math.max(12, Math.min(selectionAnchor.x, window.innerWidth - rect.width - 12));
+    const top = Math.max(12, Math.min(selectionAnchor.y + 10, window.innerHeight - rect.height - 12));
+    selectionPopup.style.left = left + 'px';
+    selectionPopup.style.top = top + 'px';
+}
 
 function showSelectionPopup(text, x, y) {
     injectSelectionPopupStyles();
@@ -375,39 +405,36 @@ function showSelectionPopup(text, x, y) {
     if (!selectionPopup) {
         selectionPopup = document.createElement('div');
         selectionPopup.id = 'yx-selection-popup';
+        selectionPopup.dataset.yxUi = '';
+        selectionPopup.setAttribute('role', 'region');
+        selectionPopup.setAttribute('aria-label', '划词翻译结果');
         document.body.appendChild(selectionPopup);
     }
 
     // 显示加载状态（DOM API 避免 XSS）
+    selectionPopup.hidden = false;
     selectionPopup.textContent = '';
     const loadingDiv = document.createElement('div');
     loadingDiv.className = 'yx-popup-loading';
     loadingDiv.textContent = '翻译中...';
     selectionPopup.appendChild(loadingDiv);
 
-    // 计算位置（避免超出屏幕）
-    const popupWidth = 320;
-    const viewportWidth = window.innerWidth;
-    let posX = x;
-    if (posX + popupWidth > viewportWidth - 20) {
-        posX = viewportWidth - popupWidth - 20;
-    }
-    if (posX < 20) posX = 20;
-
-    selectionPopup.style.left = posX + 'px';
-    selectionPopup.style.top = (y + 10) + 'px';
+    selectionAnchor = { x: x - window.scrollX, y: y - window.scrollY };
+    positionSelectionPopup();
 
     requestAnimationFrame(() => {
         selectionPopup.classList.add('show');
     });
 
     // 调用翻译
-    translateSelectedText(text);
+    translateSelectedText(text, ++selectionRequestId);
 }
 
 function hideSelectionPopup() {
+    selectionRequestId++;
     if (selectionPopup) {
         selectionPopup.classList.remove('show');
+        selectionPopup.hidden = true;
     }
 }
 
@@ -427,10 +454,26 @@ function appendEngineResult(container, engineName, translatedText, error) {
         content.textContent = translatedText;
     }
     wrapper.appendChild(content);
+    if (!error && typeof translatedText === 'string') {
+        const copy = document.createElement('button');
+        copy.type = 'button';
+        copy.textContent = '复制译文';
+        copy.setAttribute('aria-label', '复制' + engineName + '译文');
+        copy.addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(translatedText);
+                copy.textContent = '已复制';
+            } catch (e) {
+                copy.textContent = '复制未获允许，请选中文字复制';
+            }
+            positionSelectionPopup();
+        });
+        wrapper.appendChild(copy);
+    }
     container.appendChild(wrapper);
 }
 
-async function translateSelectedText(text) {
+async function translateSelectedText(text, requestId) {
     if (!chrome.runtime?.id) return;
 
     try {
@@ -440,7 +483,9 @@ async function translateSelectedText(text) {
             text: text
         });
 
-        if (response?.success && selectionPopup) {
+        if (requestId !== selectionRequestId) return;
+        if (!response?.success) throw new Error('translation failed');
+        if (selectionPopup) {
             selectionPopup.textContent = '';
             const { primary, secondary } = response.results;
 
@@ -462,15 +507,22 @@ async function translateSelectedText(text) {
                 origDiv.textContent = text;
                 selectionPopup.appendChild(origDiv);
             }
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.textContent = '关闭';
+            close.addEventListener('click', hideSelectionPopup);
+            selectionPopup.appendChild(close);
+            positionSelectionPopup();
         }
     } catch (e) {
-        if (selectionPopup) {
+        if (selectionPopup && requestId === selectionRequestId) {
             selectionPopup.textContent = '';
             const errDiv = document.createElement('div');
             errDiv.className = 'yx-popup-result';
             errDiv.style.color = '#d93025';
             errDiv.textContent = '翻译失败';
             selectionPopup.appendChild(errDiv);
+            positionSelectionPopup();
         }
     }
 }
@@ -532,9 +584,12 @@ function initSelectionTranslate() {
     });
 
     // 滚动时隐藏气泡
-    document.addEventListener('scroll', () => {
-        hideSelectionPopup();
+    document.addEventListener('scroll', (e) => {
+        if (!selectionPopup?.contains(e.target)) hideSelectionPopup();
     }, true);
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape') hideSelectionPopup();
+    });
 }
 
 // Toast UI Implementation
@@ -611,11 +666,12 @@ function showToast(message, type = 'loading') {
     if (!container) {
         container = document.createElement('div');
         container.id = 'yx-toast-container';
+        container.dataset.yxUi = '';
         document.body.appendChild(container);
     }
 
     // 使用 DOM API 构建，避免 XSS
-    container.innerHTML = '';
+    container.textContent = '';
     const msgDiv = document.createElement('div');
     msgDiv.className = 'yx-toast-message';
     if (type === 'success') {
@@ -691,6 +747,7 @@ let pendingCacheUpdates = {}; // 待保存的缓存更新
 let dynamicTranslationBudgetStartedAt = 0;
 let dynamicTranslationBudgetChars = 0;
 const originalTextMap = new WeakMap(); // 存储原文: Node -> String
+let translatedTextMap = new WeakMap(); // 独立保存译文，双语开关只重绘，不请求网络
 const translationCache = new Map();    // 内存缓存: String -> String（使用 LRU 策略）
 const MAX_PENDING_NODES = 100; // MutationObserver 最大待处理节点数
 
@@ -786,12 +843,15 @@ const translateStats = { totalTranslated: 0, cacheHits: 0, apiCalls: 0 };
 
 // 双语对照模式
 let bilingualMode = false;
+let bilingualRevision = 0;
 
 // 划词翻译开关（popup 可关闭；默认开启）
 let selectionTranslateEnabled = true;
 
-// 当前翻译目标语言（用于检测语言切换）
-let currentTargetLang = null;
+let pageOutcome = null;
+let retryCacheBypass = new Set(); // 强制重译失败后，重试不能拿旧缓存冒充成功
+let pageRetryState = null; // 仅保留未完成整页任务的成功结果，备用译文不混入引擎缓存
+let pageRetryRevision = 0; // 清缓存后，在途任务不得恢复旧的重试暂存
 
 // 缓存是否已从 background IndexedDB 加载到内存：只在首次整页翻译时拉一次，
 // 子树翻译（MutationObserver/IntersectionObserver 触发）直接复用内存缓存
@@ -860,6 +920,7 @@ function isTextTranslatable(text, parentTagName, parentClassName, isEditable) {
 function isTranslatable(node) {
     const parent = node.parentNode;
     if (!parent) return false;
+    if (parent.closest?.('[data-yx-ui]')) return false;
     return isTextTranslatable(node.nodeValue, parent.tagName, parent.className, parent.isContentEditable);
 }
 
@@ -879,7 +940,7 @@ function getTranslatableAttrs(root = document.body) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
     let el = walker.currentNode;
     while (el) {
-        if (!IGNORED_TAGS.has(el.tagName)) {
+        if (!IGNORED_TAGS.has(el.tagName) && !el.isContentEditable && !el.closest?.('[data-yx-ui]')) {
             for (const attr of TRANSLATABLE_ATTRS) {
                 const val = el.getAttribute(attr);
                 if (val && val.trim().length >= MIN_TEXT_LENGTH) {
@@ -896,16 +957,43 @@ function getTranslatableAttrs(root = document.body) {
     return results;
 }
 
-async function loadCache() {
+// 新命名空间不读取旧的无语言/引擎缓存；旧记录保留，仍按现有 TTL 淘汰。
+function translationCacheKey(text, targetLang, engine) {
+    return JSON.stringify([2, targetLang, engine, text]);
+}
+
+function splitTranslationText(text) {
+    // 超大单节点不无限拆包；明确计为失败，后台单条/单批/每分钟限额继续生效。
+    if (text.length > 250000) return [];
+    const parts = [];
+    let start = 0;
+    while (start < text.length) {
+        let end = Math.min(start + MAX_TRANSLATION_TEXT_CHARS, text.length);
+        if (end < text.length) {
+            const slice = text.slice(start, end);
+            const sentence = [...slice.matchAll(/[.!?](?:\s+|$)|[。！？]\s*/g)].at(-1);
+            const last = sentence && sentence.index + sentence[0].length >= slice.length / 2
+                ? sentence : [...slice.matchAll(/\s+/g)].at(-1);
+            if (last && last.index + last[0].length >= slice.length / 2) end = start + last.index + last[0].length;
+            if (/[\uD800-\uDBFF]/.test(text[end - 1])) end--;
+        }
+        parts.push(text.slice(start, end));
+        start = end;
+    }
+    return parts;
+}
+
+async function loadCache(prefix) {
     if (!chrome.runtime?.id) return;
     try {
         // 从 background 的 IndexedDB 加载缓存到内存 LRU
         const response = await sendMessageWithRetry({ type: 'CACHE_GET_ALL' });
         if (response?.success && response.results) {
-            const entries = Object.entries(response.results);
+            const entries = Object.entries(response.results).filter(([key, value]) =>
+                key.startsWith(prefix) && typeof value === 'string');
             const toLoad = entries.slice(-MAX_CACHE_SIZE);
             for (const [key, value] of toLoad) {
-                translationCache.set(key, value);
+                cacheSet(key, value);
             }
         }
     } catch (e) {
@@ -914,10 +1002,11 @@ async function loadCache() {
 }
 
 // 仅在首次整页翻译时拉一次全量缓存到内存；子树翻译复用已加载的内存缓存
-async function ensureCacheLoaded() {
-    if (cacheLoaded) return;
-    await loadCache();
-    cacheLoaded = true;
+async function ensureCacheLoaded(targetLang, engine) {
+    const prefix = JSON.stringify([2, targetLang, engine]).slice(0, -1) + ',';
+    if (cacheLoaded === prefix) return;
+    await loadCache(prefix);
+    cacheLoaded = prefix;
 }
 
 // 缓存保存（带防抖，合并多次调用，写入 background IndexedDB）
@@ -951,15 +1040,18 @@ function saveCache(newTranslations) {
 function clearCache() {
     translationCache.clear();
     cacheLoaded = false;
+    pageRetryState = null;
+    pageRetryRevision++;
     if (chrome.runtime?.id) {
         sendMessageWithRetry({ type: 'CACHE_CLEAR' }).catch(() => {});
     }
 }
 
-function restoreOriginal() {
+function restoreOriginal(silent = false) {
     // 作废所有在途翻译：之后回来的 chunk 响应会因代际不符被丢弃，不会覆盖已还原内容
     translationGeneration++;
-    showToast('正在还原原文...', 'loading');
+    if (!silent) showToast('正在还原原文...', 'loading');
+    else document.getElementById('yx-toast-container')?.classList.remove('show');
     hideProgressBar();
     hideOriginalTooltip();
     if (observer) observer.disconnect();
@@ -1000,14 +1092,19 @@ function restoreOriginal() {
     resetTranslatedAttrTracker();
 
     isTranslated = false;
-    showToast('已还原原文', 'restore');
+    isTranslating = false;
+    pageOutcome = null;
+    pageRetryState = null;
+    retryCacheBypass.clear();
+    translatedTextMap = new WeakMap();
+    if (!silent) showToast('已还原原文', 'restore');
 }
 
-async function performTranslation(root = document.body, isDynamic = false) {
+async function performTranslation(root = document.body, isDynamic = false, force = false) {
     // 防止并发执行（但允许子树翻译）
     if (isTranslating && root === document.body) {
         console.log('YX翻译: 翻译正在进行中，跳过重复请求');
-        return;
+        return { cancelled: true };
     }
 
     if (root === document.body) {
@@ -1016,10 +1113,11 @@ async function performTranslation(root = document.body, isDynamic = false) {
 
     // 每次翻译用独立的命中 key 集合：多条翻译链（整页 + 视口子树）并发时互不清空
     const touchedKeys = new Set();
+    const generation = translationGeneration;
     try {
-        await _doTranslation(root, touchedKeys, isDynamic);
+        return await _doTranslation(root, touchedKeys, isDynamic, force);
     } finally {
-        if (root === document.body) {
+        if (root === document.body && generation === translationGeneration) {
             isTranslating = false;
         }
         // 兜底：异常退出时也要把已收集的 touch keys 发出去（_doTranslation 内已 flush 则此处为空操作）
@@ -1036,264 +1134,182 @@ function flushCacheTouches(keysSet) {
         .catch(() => { /* 忽略 touch 失败 */ });
 }
 
-async function _doTranslation(root = document.body, touchedKeys = new Set(), isDynamic = false) {
-    // 记录本次翻译代际（在任何 await 之前捕获）：还原/切语言会自增代际，
-    // 后续每个回写点（含缓存命中同步回写、异步 chunk 回写）比对代际，不符即丢弃，
-    // 防止在 storage 读取 / 缓存加载等 await 间隙被还原后，stale 结果又覆盖已还原的 DOM
-    let myGen = translationGeneration;
+async function _doTranslation(root = document.body, touchedKeys = new Set(), isDynamic = false, force = false) {
+    const myGen = translationGeneration;
+    const retryRevision = pageRetryRevision;
+    const displayRevision = bilingualRevision;
+    const settings = await chrome.storage.local.get(['target_lang', 'translate_engine', 'bilingual_mode']);
+    const targetLang = settings.target_lang || 'zh-CN';
+    const engine = settings.translate_engine || 'google_free';
+    if (myGen !== translationGeneration) return { cancelled: true };
+    if (displayRevision === bilingualRevision) bilingualMode = settings.bilingual_mode === true;
+    await ensureCacheLoaded(targetLang, engine);
+    if (myGen !== translationGeneration) return { cancelled: true };
 
-    // 读取目标语言和双语模式设置
-    let targetLang = 'zh-CN';
-    try {
-        const settings = await chrome.storage.local.get(['target_lang', 'bilingual_mode']);
-        if (settings.target_lang) targetLang = settings.target_lang;
-        bilingualMode = settings.bilingual_mode === true;
-    } catch (e) { /* 默认值 */ }
-
-    // 检测目标语言是否切换：如果切换了，先静默还原原文并清空缓存
-    if (currentTargetLang && currentTargetLang !== targetLang && isTranslated && root === document.body) {
-        console.log(`YX翻译: 目标语言从 ${currentTargetLang} 切换为 ${targetLang}，重新翻译`);
-        // 静默还原所有文本节点
-        const oldNodes = getTextNodes();
-        oldNodes.forEach(node => {
-            if (originalTextMap.has(node)) {
-                node.nodeValue = originalTextMap.get(node);
-            }
-        });
-        // 还原标题
-        if (originalTitle !== null) {
-            document.title = originalTitle;
-            originalTitle = null;
-        }
-        // 还原属性
-        for (const ref of translatedAttrRefs) {
-            const element = ref.deref();
-            if (!element) continue;
-            const stored = originalAttrMap.get(element);
-            if (stored) {
-                for (const [attr, val] of Object.entries(stored)) {
-                    element.setAttribute(attr, val);
-                }
-            }
-        }
-        resetTranslatedAttrTracker();
-        // 清空内存缓存（旧语言的翻译结果无法复用）
-        translationCache.clear();
-        cacheLoaded = false;
-        isTranslated = false;
-        // 切换语言：作废旧语言在途翻译，并把本次翻译归入新代际（避免自己被误判 stale）
-        translationGeneration++;
-        myGen = translationGeneration;
-    }
-    currentTargetLang = targetLang;
-
-    // 仅首次拉一次全量缓存；子树翻译/MutationObserver 不再重复 dump 全库
-    await ensureCacheLoaded();
-
-    // 代际检查：storage 读取 / 缓存加载这些 await 间隙内若用户已还原 / 切语言，立即丢弃，
-    // 避免下面命中缓存的【同步回写】把已还原的 DOM 又写回译文（此处进度条尚未显示，无需 hide）
-    if (myGen !== translationGeneration) {
-        flushCacheTouches(touchedKeys);
-        return;
-    }
-
-    const nodes = getTextNodes(root);
     const textNodeMap = new Map();
-    const missingTranslations = new Set();
-
-    nodes.forEach(node => {
-        if (!originalTextMap.has(node)) {
-            originalTextMap.set(node, node.nodeValue);
-        }
-        // 始终使用原文作为翻译源，而非当前可能已翻译的文本
-        const text = (originalTextMap.get(node) || node.nodeValue).trim();
-        const cached = cacheGet(text);
-        if (cached !== undefined) {
-            translateStats.cacheHits++;
-            translateStats.totalTranslated++;
-            touchedKeys.add(text);
-            applyTextToNode(node, cached);
-        } else {
-            if (!textNodeMap.has(text)) textNodeMap.set(text, []);
-            textNodeMap.get(text).push(node);
-            missingTranslations.add(text);
-        }
+    const add = (text, item) => {
+        if (!text.trim()) return;
+        if (!textNodeMap.has(text)) textNodeMap.set(text, []);
+        textNodeMap.get(text).push(item);
+    };
+    getTextNodes(root).forEach(node => {
+        if (!originalTextMap.has(node)) originalTextMap.set(node, node.nodeValue);
+        add(originalTextMap.get(node).trim(), node);
     });
-
-    // 整页翻译时：翻译 document.title 和 HTML 属性
-    if (root === document.body || root === document.documentElement) {
-        // 翻译 document.title（使用原始标题作为翻译源）
-        const titleText = (originalTitle || document.title).trim();
-        if (titleText.length >= MIN_TEXT_LENGTH && !/^[\u4e00-\u9fa5]+$/.test(titleText)) {
-            if (originalTitle === null) {
-                originalTitle = document.title;
-            }
-            const cachedTitle = cacheGet(titleText);
-            if (cachedTitle !== undefined) {
-                document.title = cachedTitle;
-                translateStats.cacheHits++;
-                touchedKeys.add(titleText);
-            } else {
-                missingTranslations.add(titleText);
-                if (!textNodeMap.has(titleText)) textNodeMap.set(titleText, []);
-                textNodeMap.get(titleText).push({ __isTitle: true });
-            }
+    const isFullPage = root === document.body || root === document.documentElement;
+    if (isFullPage) {
+        const titleText = (originalTitle ?? document.title).trim();
+        if (titleText.length >= MIN_TEXT_LENGTH) {
+            if (originalTitle === null) originalTitle = document.title;
+            add(titleText, { __isTitle: true });
         }
-
-        // 收集可翻译属性（使用原始属性值作为翻译源）
-        const attrItems = getTranslatableAttrs(root);
-        attrItems.forEach(({ element, attr }) => {
-            if (!originalAttrMap.has(element)) {
-                originalAttrMap.set(element, {});
-            }
+        getTranslatableAttrs(root).forEach(({ element, attr }) => {
+            if (!originalAttrMap.has(element)) originalAttrMap.set(element, {});
             const stored = originalAttrMap.get(element);
-            if (!stored[attr]) {
-                stored[attr] = element.getAttribute(attr);
-            }
-            // 始终使用原始属性值作为翻译源
-            const text = stored[attr].trim();
+            if (!Object.hasOwn(stored, attr)) stored[attr] = element.getAttribute(attr);
             recordTranslatedAttrElement(element);
-            const cached = cacheGet(text);
-            if (cached !== undefined) {
-                element.setAttribute(attr, cached);
-                translateStats.cacheHits++;
-                touchedKeys.add(text);
-            } else {
-                missingTranslations.add(text);
-                if (!textNodeMap.has(text)) textNodeMap.set(text, []);
-                textNodeMap.get(text).push({ __isAttr: true, element, attr });
-            }
+            add(stored[attr].trim(), { __isAttr: true, element, attr });
         });
     }
 
-    const chunks = chunkTranslationTexts(Array.from(missingTranslations));
-    const textsToTranslate = chunks.flat();
-    if (textsToTranslate.length === 0) {
-        isTranslated = true;
-        // 全部命中缓存的情况：仍需 flush 已收集的命中 key，否则 lastAccess 永不更新
-        flushCacheTouches(touchedKeys);
-        return;
-    }
-
-    if (isDynamic) {
-        const dynamicChars = textsToTranslate.reduce((sum, text) => sum + text.length, 0);
-        if (!consumeDynamicTranslationBudget(dynamicChars)) return;
-    }
-
-    const totalCount = textsToTranslate.length;
-    const isFullPage = root === document.body || root === document.documentElement;
-    const showProgress = totalCount > 5;
-
-    // 整页翻译时显示进度条和 Toast
-    if (showProgress && isFullPage) {
-        showProgressBar();
-        showToast(`翻译中 0/${totalCount}...`, 'loading');
-    }
-
-    const MAX_CONCURRENT = 3; // 最多同时发送 3 个 chunk
-    let translatedCount = 0;
-    let consecutiveFailedBatches = 0; // 连续"整批全失败"的批次数，用于熔断
-
-    // 并发发送 chunk（限制并发数）
-    for (let i = 0; i < chunks.length; i += MAX_CONCURRENT) {
-        if (!chrome.runtime?.id) break;
-
-        const concurrentChunks = chunks.slice(i, i + MAX_CONCURRENT);
-        const promises = concurrentChunks.map(chunk =>
-            sendMessageWithRetry({
-                type: 'TRANSLATE_TEXT_BATCH',
-                texts: chunk
-            }).then(response => ({ response, chunk }))
-              .catch(e => ({ error: e, chunk }))
-        );
-
-        const results = await Promise.all(promises);
-
-        // 代际检查：在途期间用户已还原 / 切换语言 → 丢弃 stale 结果，停止回写
-        if (myGen !== translationGeneration) {
-            if (isFullPage && showProgress) hideProgressBar();
-            return;
-        }
-
-        let batchSuccess = 0;
-        let batchFailure = 0;
-        for (const { response, error, chunk } of results) {
-            if (error) {
-                batchFailure++;
-                console.warn('YX翻译: 翻译消息错误:', error);
+    const plans = new Map();
+    const retry = isFullPage && !force && pageRetryState?.targetLang === targetLang && pageRetryState.engine === engine
+        ? pageRetryState : null;
+    if (isFullPage) pageRetryState = null;
+    const received = new Map();
+    const retryResults = new Map();
+    const missing = new Set();
+    if (force) retryCacheBypass.clear();
+    const keyFor = text => translationCacheKey(text, targetLang, engine);
+    for (const source of textNodeMap.keys()) {
+        const parts = splitTranslationText(source);
+        plans.set(source, parts);
+        for (const part of parts) {
+            const text = part.trim();
+            if (!text) continue;
+            if (retry?.results.has(text)) {
+                received.set(text, retry.results.get(text));
+                retryResults.set(text, retry.results.get(text));
                 continue;
             }
-            if (response && response.success) {
-                saveCache(response.results);
-                applyBatchTranslations(response.results, textNodeMap);
-                applyBatchSpecialTranslations(response.results, textNodeMap);
-                translatedCount += chunk.length;
-                translateStats.apiCalls += chunk.length;
-                translateStats.totalTranslated += chunk.length;
-                batchSuccess++;
-            } else if (response && !response.success) {
-                batchFailure++;
-                console.warn('YX翻译: 批次翻译失败', response.error);
+            const key = keyFor(text);
+            if (force) retryCacheBypass.add(key);
+            const cached = retryCacheBypass.has(key) ? undefined : cacheGet(key);
+            if (cached !== undefined) {
+                received.set(text, cached);
+                touchedKeys.add(key);
+            } else {
+                missing.add(text);
             }
         }
-
-        // 熔断：只有"整批全部失败"才累加；本批有任一成功即清零。
-        // 旧逻辑在单 chunk 成功时清零整体计数，导致间歇性失败永远攒不到阈值
-        if (batchSuccess > 0) {
-            consecutiveFailedBatches = 0;
-        } else if (batchFailure > 0) {
-            consecutiveFailedBatches++;
-        }
-
-        // 更新进度
-        if (showProgress) {
-            const percent = Math.round((translatedCount / totalCount) * 100);
-            if (isFullPage) updateProgress(percent);
-            showToast(`翻译中 ${translatedCount}/${totalCount} (${percent}%)`, 'loading');
-        }
-
-        // 连续两批整批失败 → 熔断中止
-        if (consecutiveFailedBatches >= 2) {
-            if (isFullPage) hideProgressBar();
-            showToast('翻译遇到问题，部分内容可能未翻译', 'error');
-            break;
-        }
     }
 
-    // 翻译完成，隐藏进度条
-    if (showProgress && isFullPage) {
-        hideProgressBar();
+    const applied = new Set();
+    // 整段必须拿齐译文再回写；保留切分处的空格，失败时保留完整原文。
+    const applyReady = () => {
+        const ready = Object.create(null);
+        for (const [source, parts] of plans) {
+            if (applied.has(source) || !parts.length) continue;
+            if (!parts.every(part => !part.trim() || received.has(part.trim()))) continue;
+            ready[source] = parts.map(part => {
+                if (!part.trim()) return part;
+                const match = part.match(/^(\s*)([\s\S]*?)(\s*)$/);
+                return match[1] + received.get(part.trim()).trim() + match[3];
+            }).join('');
+            applied.add(source);
+        }
+        applyBatchTranslations(ready, textNodeMap);
+        applyBatchSpecialTranslations(ready, textNodeMap);
+        translateStats.totalTranslated += Object.keys(ready).length;
+    };
+    applyReady();
+    translateStats.cacheHits += applied.size;
+    const chunks = chunkTranslationTexts([...missing]);
+    if (isDynamic && !consumeDynamicTranslationBudget([...missing].reduce((n, text) => n + text.length, 0))) {
+        return { total: plans.size, completed: applied.size, failed: plans.size - applied.size };
     }
-    isTranslated = true;
 
-    // 异步触摸 lastAccess，让活跃缓存数据不被 TTL 清掉（不 await，失败也不影响主流程）
+    if (isFullPage && chunks.length) {
+        showProgressBar();
+        showToast('翻译中，请稍候…', 'loading');
+    }
+    let failedBatches = 0;
+    let fallbackUsed = retryResults.size > 0 && retry?.fallbackUsed === true;
+    let failureReason = [...plans.values()].some(parts => !parts.length) ? '单段内容过长，超出安全处理上限' : '';
+    for (let i = 0; i < chunks.length; i += 3) {
+        if (myGen !== translationGeneration || !chrome.runtime?.id) return { cancelled: true };
+        const results = await Promise.all(chunks.slice(i, i + 3).map(async texts => {
+            try {
+                const response = await sendMessageWithRetry({
+                    type: 'TRANSLATE_TEXT_BATCH', texts, targetLang, engine
+                });
+                return { response, texts };
+            } catch (error) {
+                return { texts };
+            }
+        }));
+        if (myGen !== translationGeneration) return { cancelled: true };
+        let batchSuccess = 0;
+        for (const { response, texts } of results) {
+            if (response?.error === 'translation rate limit exceeded') failureReason = '请求较多，请稍后重试';
+            if (!response?.success || response.targetLang !== targetLang || response.engine !== engine) continue;
+            fallbackUsed ||= response.fallbackUsed === true;
+            const cacheEntries = Object.create(null);
+            for (const text of texts) {
+                const translated = response.results?.[text];
+                if (!Object.hasOwn(response.results || {}, text) || typeof translated !== 'string' || !translated.trim()) continue;
+                received.set(text, translated);
+                batchSuccess++;
+                if (Object.hasOwn(response.cacheableResults || {}, text)) {
+                    cacheEntries[keyFor(text)] = translated;
+                    retryCacheBypass.delete(keyFor(text));
+                } else {
+                    retryResults.set(text, translated);
+                }
+            }
+            saveCache(cacheEntries);
+            translateStats.apiCalls++;
+        }
+        applyReady();
+        failedBatches = batchSuccess ? 0 : failedBatches + 1;
+        if (isFullPage) {
+            updateProgress(plans.size ? Math.round(applied.size / plans.size * 100) : 0);
+            showToast('已翻译 ' + applied.size + '/' + plans.size + ' 条', 'loading');
+        }
+        if (failedBatches >= 2) break;
+    }
+    if (isFullPage) hideProgressBar();
+    isTranslated = isTranslated || applied.size > 0;
     flushCacheTouches(touchedKeys);
+    if (isFullPage && retryRevision === pageRetryRevision && applied.size < plans.size && retryResults.size) {
+        pageRetryState = { results: retryResults, targetLang, engine, fallbackUsed };
+    }
+    return { total: plans.size, completed: applied.size, failed: plans.size - applied.size, fallbackUsed, failureReason, targetLang, engine };
 }
 
 function applyTextToNode(node, translatedText) {
-    const current = node.nodeValue;
-    if (!current) return;
-    const originalText = originalTextMap.get(node) || current;
-    const match = current.match(/^(\s*)([\s\S]*?)(\s*)$/);
-    if (match) {
-        const [_, prefix, content, suffix] = match;
-        if (bilingualMode && translatedText !== content) {
-            node.nodeValue = prefix + translatedText + '\n' + originalText.trim() + suffix;
-        } else {
-            node.nodeValue = prefix + translatedText + suffix;
-        }
-    } else {
-        if (bilingualMode) {
-            node.nodeValue = translatedText + '\n' + originalText.trim();
-        } else {
-            node.nodeValue = translatedText;
-        }
+    const originalText = originalTextMap.get(node) ?? node.nodeValue;
+    if (!originalText) return;
+    translatedTextMap.set(node, translatedText);
+    const [, prefix, source, suffix] = originalText.match(/^(\s*)([\s\S]*?)(\s*)$/);
+    const body = bilingualMode && translatedText.trim() !== source
+        ? translatedText + '\n' + source : translatedText;
+    node.nodeValue = prefix + body + suffix;
+}
+
+// 开关只重绘已翻译节点；不调用网络、不依赖缓存是否仍存在。
+function updateBilingualMode(enabled) {
+    bilingualRevision++;
+    bilingualMode = enabled === true;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+        if (translatedTextMap.has(node)) applyTextToNode(node, translatedTextMap.get(node));
     }
 }
 
 function applyBatchTranslations(results, textNodeMap) {
     for (const [original, translated] of Object.entries(results)) {
-        if (original === translated) continue;
         const nodes = textNodeMap.get(original);
         if (nodes) {
             nodes.forEach(node => {
@@ -1308,7 +1324,6 @@ function applyBatchTranslations(results, textNodeMap) {
 // 应用 title 和属性翻译
 function applyBatchSpecialTranslations(results, textNodeMap) {
     for (const [original, translated] of Object.entries(results)) {
-        if (original === translated) continue;
         const items = textNodeMap.get(original);
         if (!items) continue;
         items.forEach(item => {
@@ -1405,31 +1420,39 @@ function detectPageLanguage(targetLang = 'zh-CN') {
 let autoTranslateTriggered = false; // 防止重复触发
 
 // 触发自动翻译
-function triggerAutoTranslate(targetLang) {
-    const detectedLang = detectPageLanguage(targetLang);
-    if (detectedLang !== 'target') {
-        autoTranslateTriggered = true;
-        resetDynamicTranslationBudget();
-        console.log('YX翻译: 检测到外语内容，开始翻译...');
-        showToast('正在自动为您翻译...', 'loading');
+async function startPageTranslation(force = false) {
+    if (isTranslating) return;
+    const generation = translationGeneration;
+    resetDynamicTranslationBudget();
+    pageOutcome = null;
+    showToast('开始分析页面…', 'loading');
+    try {
+        const outcome = await performTranslation(document.body, false, force);
+        if (!outcome || outcome.cancelled || generation !== translationGeneration || !chrome.runtime?.id) return;
+        if (outcome.completed > 0) enableAutoTranslate();
+        let message = outcome.failed
+            ? (outcome.completed ? '部分完成：' + outcome.completed + '/' + outcome.total + ' 条；可重试未完成内容'
+                : '翻译失败，请重试')
+            : (outcome.total ? '翻译完成' : '没有需要翻译的内容');
+        if (outcome.failureReason) message += '；' + outcome.failureReason;
+        if (outcome.fallbackUsed) message += '（部分使用免费备用引擎）';
+        pageOutcome = { ...outcome, message };
+        if (outcome.failed) autoTranslateTriggered = true; // 不因切回标签页静默重试失败请求
+        showToast(message, outcome.failed ? 'error' : 'success');
+        sendMessageWithRetry({ type: 'TRANSLATION_DONE', ...pageOutcome }).catch(() => {});
+    } catch (e) {
+        if (generation !== translationGeneration) return;
+        hideProgressBar();
+        pageOutcome = { failed: 1, completed: 0, message: '翻译失败，请重试' };
+        showToast(pageOutcome.message, 'error');
+        sendMessageWithRetry({ type: 'TRANSLATION_DONE', ...pageOutcome }).catch(() => {});
+    }
+}
 
-        performTranslation()
-            .then(() => {
-                if (chrome.runtime?.id) {
-                    enableAutoTranslate();
-                    showToast('翻译完成', 'success');
-                    sendMessageWithRetry({ type: 'TRANSLATION_DONE' }).catch(() => {});
-                }
-            })
-            .catch(e => {
-                console.error('YX翻译: 自动翻译失败', e);
-                hideProgressBar();
-                showToast('翻译失败，请重试', 'error');
-                isTranslating = false;
-                autoTranslateTriggered = false;
-            });
-    } else {
-        console.log('YX翻译: 页面语言与目标语言相同，跳过翻译');
+function triggerAutoTranslate(targetLang) {
+    if (detectPageLanguage(targetLang) !== 'target') {
+        autoTranslateTriggered = true;
+        startPageTranslation();
     }
 }
 
@@ -1570,23 +1593,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (!chrome.runtime?.id) return;
 
     if (request.type === 'START_TRANSLATE') {
-        resetDynamicTranslationBudget();
-        showToast('开始分析页面...', 'loading');
-        performTranslation()
-            .then(() => {
-                if (chrome.runtime?.id) {
-                    enableAutoTranslate();
-                    showToast('翻译完成', 'success');
-                    sendMessageWithRetry({ type: 'TRANSLATION_DONE' }).catch(() => {});
-                }
-            })
-            .catch(e => {
-                console.error('YX翻译: 手动翻译失败', e);
-                hideProgressBar();
-                showToast('翻译失败，请重试', 'error');
-                isTranslating = false;
-            });
+        startPageTranslation(request.force === true);
         sendResponse({ status: 'started' });
+    } else if (request.type === 'GET_TRANSLATION_STATUS') {
+        sendResponse({ running: isTranslating, outcome: pageOutcome });
     } else if (request.type === 'RESTORE_ORIGINAL') {
         restoreOriginal();
         sendResponse({ status: 'restored' });
@@ -1606,6 +1616,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // popup 用于显示"敏感站点，已禁用自动翻译"提示
         sendResponse({ sensitive: isSensitiveHost(window.location.hostname, window.location.protocol) });
     }
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !chrome.runtime?.id) return;
+    if (changes.target_lang || changes.translate_engine) {
+        // 立即作废旧请求，避免设置切换后在途译文继续回写或写错缓存。
+        if (isTranslated || isTranslating) restoreOriginal(true);
+        else translationGeneration++;
+        pageOutcome = null;
+        autoTranslateTriggered = true;
+    }
+    if (changes.bilingual_mode && document.body) updateBilingualMode(changes.bilingual_mode.newValue);
 });
 
 // ===== 测试导出（仅 Node 环境；浏览器中 module 未定义，不影响运行）=====

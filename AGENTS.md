@@ -4,14 +4,14 @@ This file provides guidance to Codex CLI and other AI coding agents when working
 
 ## 项目概述
 
-YX 纯净网页翻译（v1.5.4）— Chrome Manifest V3 扩展，把网页内容翻译为目标语言。**核心思想**：用 `TreeWalker` 遍历 DOM 文本节点逐节点替换 `nodeValue`，而非替换 `innerHTML`，避免破坏 React/Vue/SPA 框架的组件状态与事件绑定。
+YX 纯净网页翻译（v1.5.5）— Chrome Manifest V3 扩展，把网页内容翻译为目标语言。**核心思想**：用 `TreeWalker` 遍历 DOM 文本节点逐节点替换 `nodeValue`，而非替换 `innerHTML`，避免破坏 React/Vue/SPA 框架的组件状态与事件绑定。
 
 ## 开发命令
 
 纯原生 ES6+ JS，**无构建步骤、无依赖**。
 
 ```bash
-# 测试（仅覆盖纯函数；异步链路、DOM 还原、IDB 操作未覆盖，改完核心逻辑必须实测）
+# 测试（纯函数 + 模拟浏览器边界的回归；实际扩展/DOM/IDB 仍需浏览器实测）
 node tests/run-tests.js
 
 # 单个 describe block 没有筛选机制，要单独跑就临时改 tests/run-tests.js 注释掉别的 describe
@@ -44,12 +44,13 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 
 | 类型 | 方向 | 说明 |
 |---|---|---|
-| `START_TRANSLATE` | popup/background → content | 触发当前页翻译；不改变网站自动翻译偏好 |
+| `START_TRANSLATE` | popup/background → content | 翻译/重试当前页；部分失败暂存已成功结果供重试，备用译文不写入引擎缓存；`force: true` 忽略缓存及暂存重新翻译，不改变网站偏好 |
 | `RESTORE_ORIGINAL` | popup/background → content | 还原原文 |
 | `TRANSLATE_SELECTION` | background → content | 右键菜单划词翻译 |
-| `TRANSLATE_TEXT_BATCH` | content → background | 批量翻译请求 |
+| `TRANSLATE_TEXT_BATCH` | content → background | 携带固定 `targetLang` / `engine`；返回实际结果、可缓存结果及回退标记 |
 | `TRANSLATE_COMPARE` | content → background | 划词翻译多引擎对比（当前引擎 + Google Free） |
-| `TRANSLATION_DONE` | content → background | 更新图标徽章 ✓ |
+| `TRANSLATION_DONE` | content → background/popup | 返回完成/失败数量，成功徽章 ✓、有失败 ! |
+| `GET_TRANSLATION_STATUS` | popup → content | 弹窗重开后读取运行状态及上次结果 |
 | `GET_SITE_STATUS` | popup → content | 查询当前页是否敏感站（popup 显示"敏感站点 · 不自动翻译"并禁用「自动」按钮） |
 | `CACHE_GET_ALL` / `CACHE_PUT_BATCH` / `CACHE_CLEAR` / `CACHE_COUNT` | popup/content → background | IDB 缓存读写 |
 | `CACHE_TOUCH` | content → background | 命中缓存后批量更新 `lastAccess`（防活跃数据被 TTL 清掉） |
@@ -61,15 +62,15 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 2. **AbortController + 15s 超时**：`_handleBatchTranslation` 为每组创建 `AbortController`，15 秒触发 `controller.abort()`，所有 fetch 链路（`translateBulk` / `translateGoogleCloud` / `translateDeepL` / `translateBaidu` / `translateWithLLM` / `translateFallback` / `translateSingle`）都接收并透传 `signal`。**新增引擎或修改 fetch 链路必须传 signal**；catch 块要识别 `signal?.aborted || e?.name === 'AbortError'` 不进入回退逻辑（防止 abort 后又打 google_free 重新发起请求）。
 3. **`normalizeTargetLang` / `normalizeEngine`**：`background.js` 顶部定义白名单。从 `chrome.storage.local` 读出来的 `target_lang` / `translate_engine` 必须经过 normalize 才能用，防止脏数据进 URL 或 LLM prompt。
 4. **API 错误净化**：4xx/5xx 响应**不透传 body**，只保留 status，避免 key 片段 / 请求摘要泄漏。
-5. **performTranslation `.catch()` 兜底**：`content.js` 里两处调用点（`triggerAutoTranslate` 和 `START_TRANSLATE` 处理）都必须有 catch：失败时 `hideProgressBar()` + `showToast('翻译失败','error')` + `isTranslating = false` + `autoTranslateTriggered = false`。
+5. **统一翻译状态**：手动/自动入口共用 `startPageTranslation()` 的异常与结果处理；失败/超时不得伪造原文译文或写入缓存。`performTranslation()` 的 `finally` 释放同代际的锁；取消后的旧结果不得再显示完成。
 6. **不可信页面输入限额**：`TRANSLATE_TEXT_BATCH` / `TRANSLATE_COMPARE` 必须校验 content sender、单条/单批大小和每标签页时间窗预算；自动划词必须要求 `event.isTrusted`；MutationObserver 子树翻译受动态字符预算限制。
 
 ## background.js（Service Worker）
 
 - **9 个翻译引擎**：`google_free` / `google_cloud` / `deepl` / `baidu` / `openai` / `claude` / `deepseek` / `minimax` / `glm`
 - **路由**：`translateByEngine(texts, targetLang, engine, apiKeys, signal)` 按 `engine` 分发
-- **LLM 批量协议**：编号列表格式 `[1] text\n[2] text`，回包用 `/^\[(\d+)\]\s*(.+)$/` 匹配。未匹配的条目保留原文
-- **回退链**：任何非 `google_free` 引擎失败（非 abort）→ `translateBulk`（Google Free，行数不匹配/限流时 → `translateBulkFallback`（逐条 `translateSingle`）→ MyMemory `translateFallback`）→ 原文
+- **LLM 批量协议**：编号列表格式 `[1] text\n[2] text`，回包用 `/^\[(\d+)\]\s*(.+)$/` 匹配。未匹配的条目不进入成功结果，页面保留原文并提示失败
+- **回退链**：任何非 `google_free` 引擎失败（非 abort）→ `translateBulk`（Google Free，行数不匹配/限流时 → `translateBulkFallback`（逐条 `translateSingle`）→ MyMemory `translateFallback`）→ 标记失败、页面保留原文（不缓存失败项）
 - **DeepL 自动区分 Free/Pro**：密钥以 `:fx` 结尾走 `api-free.deepl.com`
 - **百度签名**：自带纯 JS `md5()`（SW 不支持同步 `crypto.subtle`）。`md5` 函数内嵌于 `background.js` 第 ~600 行起，处理 UTF-8 字节
 - **术语校对（`refineTranslation`）**：用 `AI_GLOSSARY`（内置 420+ AI 相关术语）+ 用户自定义术语（`storage.sync.user_glossary`）。**仅 `targetLang.startsWith('zh')` 生效**。Google Cloud / DeepL / 百度的批量结果走 `Promise.all` 并行校对（不要回到串行 await）。`buildCompiledGlossary()` 有进程内缓存，`chrome.storage.onChanged` 监听 `user_glossary` 变化时置空缓存
@@ -82,10 +83,10 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 |---|---|
 | DB | `yx-translate-cache` (version 2) |
 | Store | `translations` |
-| key | 原文字符串 |
+| key | `JSON.stringify([2, targetLang, engine, text])`；长段落缓存各片段 |
 | value | `{ v: 译文, t: 最近访问时间戳 ms }`（v1 旧纯字符串通过 `unwrapCacheValue` 自动兼容） |
 
-- `cachePutBatch(entries)`：写入时强制设 `t = Date.now()`
+- `cachePutBatch(entries)`：写入时强制设 `t = Date.now()`；content 仅保存真实成功且未降级到其他引擎的结果。旧无命名空间缓存不再命中，不主动删除，沿用 TTL 淘汰。
 - `cacheTouchBatch(keys)`：批量更新 `t` 为 now，由 content.js 在命中缓存后异步调用
 - `cleanupCache()`：阶段 1 删除 `t < now - 30天` 的条目；阶段 2 总字节超过 50 MB 时按 `t` 升序继续删
 - **两个 alarm 触发清理**：
@@ -100,8 +101,8 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 - **双层缓存**：
   - 内存 LRU：`translationCache` (Map, 上限 `MAX_CACHE_SIZE = 10000`)
   - 持久 IDB：通过 background 的 `CACHE_*` 消息
-  - **`cacheLoaded` 标志**：`ensureCacheLoaded()` 只在首次整页翻译时拉一次 `CACHE_GET_ALL`；MutationObserver / IntersectionObserver 触发的子树翻译复用内存缓存。语言切换 / `clearCache()` 时重置标志
-- **`cacheTouchedKeys` + `flushCacheTouches()`**：命中缓存的 key 收集起来；在 _doTranslation 早退、正常结束、`performTranslation` 的 `finally` **三处都必须 flush**（异常退出兜底）
+  - **`cacheLoaded` 标志**：记录已加载的语言/引擎命名空间；同一命名空间复用内存缓存，加载时过滤旧键。`retryCacheBypass` 防止强制重译失败后重试命中旧缓存。
+- **`flushCacheTouches()`**：每次任务独立收集命中的命名空间 key；正常结束刷新，`performTranslation` 的 `finally` 兜底刷新早退/异常路径。
 - **`translatedAttrRefs` 内存管理**：
   - WeakRef 数组存放已翻译属性元素
   - `recordTranslatedAttrElement()` 用 WeakSet 查重，避免同元素重复 push
@@ -110,7 +111,9 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 - **MutationObserver**：监听 `document.body subtree:true`，200ms 防抖，`pendingNodes` 集合上限 `MAX_PENDING_NODES = 100`，动态缺失文本每分钟最多 50,000 字符
 - **IntersectionObserver**：rootMargin 200px 视口预加载翻译
 - **悬停显示原文**：事件委托 + 1 秒延迟
-- **划词翻译多引擎对比**：发 `TRANSLATE_COMPARE` 消息，气泡同时显示当前引擎和 Google Free 结果
+- **划词翻译多引擎对比**：发 `TRANSLATE_COMPARE` 消息，气泡显示当前引擎和 Google Free 结果；成功结果可复制，支持关闭/Esc、内部滚动与视口边界定位，过期请求不能覆盖新选择。
+- **长段落**：`splitTranslationText()` 优先按句子切至 1500 字符以内，凑齐译文再完整回写；超 250000 字符单节点明确提示失败，已有消息/时间窗限额不变。
+- **双语即时切换**：`translatedTextMap` 单独保存译文，`storage.onChanged` 只重绘已有结果；语言/引擎变化立即还原并作废旧请求，不自动发送新翻译。
 - **三种翻译模式 + 网站偏好**：模式 `auto_all` / `whitelist` / `manual`；偏好 `site_preferences[domain]: 'auto' | 'never'`，**优先级高于模式**
 
 ## popup.js（扩展页 UI）
@@ -129,7 +132,7 @@ background.js (Service Worker：9 引擎路由 + IDB 持久缓存 + 术语校对
 | `translate_engine` | local | string | 经 `normalizeEngine` 校验 |
 | `target_lang` | local | string | 经 `normalizeTargetLang` 校验 |
 | `api_keys` | local | object | **存 local 不存 sync**，避免上传 Google 账号 |
-| `bilingual_mode` | local | boolean | 双语对照 |
+| `bilingual_mode` | local | boolean | 双语对照，即时重绘已有译文，不额外请求 |
 | `selection_translate_enabled` | local | boolean | 划词翻译开关（默认 true；content 用 `storage.onChanged` 即时生效；敏感站 mouseup 划词强制不发，右键菜单显式翻译不受限） |
 | `user_glossary` | **sync** | `{keyword, badWord, goodWord}[]` | **会同步到 Google 账号**，隐私政策已声明 |
 | `auto_translate_enabled` / `excluded_domains` | local | — | **旧版**，仅 `onInstalled` 迁移用 |

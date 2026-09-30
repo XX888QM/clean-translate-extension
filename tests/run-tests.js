@@ -364,21 +364,21 @@ await describe('parseLLMReply [真源码 background.js — 5 个 LLM 引擎共�
         const r = bg.parseLLMReply('[3] 福\n[1] 你好\n[2] 世界', texts);
         assert.deepEqual(r, { Hello: '你好', World: '世界', Foo: '福' });
     });
-    await it('缺号的条目保留原文', () => {
+    await it('缺号条目不冒充成功译文', () => {
         const r = bg.parseLLMReply('[1] 你好\n[3] 福', texts);
         assert.equal(r.Hello, '你好');
-        assert.equal(r.World, 'World'); // 缺 [2]，保留原文
+        assert.equal(r.World, undefined);
         assert.equal(r.Foo, '福');
     });
     await it('越界编号被忽略不抛错', () => {
         const r = bg.parseLLMReply('[1] 你好\n[9] 越界', texts);
         assert.equal(r.Hello, '你好');
-        assert.equal(r.World, 'World');
-        assert.equal(r.Foo, 'Foo');
+        assert.equal(r.World, undefined);
+        assert.equal(r.Foo, undefined);
     });
-    await it('空回包全部保留原文', () => {
+    await it('空回包没有成功结果', () => {
         const r = bg.parseLLMReply('', texts);
-        assert.deepEqual(r, { Hello: 'Hello', World: 'World', Foo: 'Foo' });
+        assert.deepEqual(r, {});
     });
     await it('构造↔解析 round-trip 对称', () => {
         const src = ['Alpha', 'Beta'];
@@ -576,7 +576,7 @@ await describe('popup 与 background 语言/引擎选项一致性 [静态解析 
 }
 
 // ===== 运行 + 输出 =====
-main().then(() => {
+main().then(() => require('./translation-regressions')(it)).then(() => {
     console.log('\n' + '='.repeat(50));
     console.log(`  测试完成: ${passedTests}/${totalTests} 通过`);
     if (failedTests > 0) {

@@ -1,3 +1,21 @@
+let activeTabId = null;
+
+function showTranslationOutcome(outcome) {
+    const status = document.getElementById('status');
+    status.textContent = outcome.message;
+    status.style.color = outcome.failed > 0 ? '#d93025' : '#188038';
+    document.getElementById('retryBtn').hidden = !(outcome.failed > 0);
+}
+
+function saveTranslationSetting(key, value) {
+    chrome.storage.local.set({ [key]: value }, () => {
+        const status = document.getElementById('status');
+        status.textContent = chrome.runtime.lastError ? '设置保存失败，请重试' : '设置已切换，请点击翻译';
+        status.style.color = chrome.runtime.lastError ? '#d93025' : '#5f6368';
+        if (!chrome.runtime.lastError) document.getElementById('retryBtn').hidden = true;
+    });
+}
+
 function sendMessageToTab(message) {
     const statusDiv = document.getElementById('status');
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -39,6 +57,7 @@ function sendMessageToTab(message) {
                 } else if (message.type === 'RESTORE_ORIGINAL') {
                     statusDiv.textContent = "已还原原文";
                     statusDiv.style.color = "#5f6368";
+                    document.getElementById('retryBtn').hidden = true;
                 }
             }
         });
@@ -54,6 +73,13 @@ document.getElementById('restoreBtn').addEventListener('click', () => {
     sendMessageToTab({ type: 'RESTORE_ORIGINAL' });
 });
 
+document.getElementById('retryBtn').addEventListener('click', () => {
+    sendMessageToTab({ type: 'START_TRANSLATE' });
+});
+document.getElementById('retranslateBtn').addEventListener('click', () => {
+    sendMessageToTab({ type: 'START_TRANSLATE', force: true });
+});
+
 // ========== 目标语言选择 ==========
 const targetLangSelect = document.getElementById('targetLangSelect');
 
@@ -65,7 +91,7 @@ chrome.storage.local.get(['target_lang'], (result) => {
 });
 
 targetLangSelect.addEventListener('change', () => {
-    chrome.storage.local.set({ target_lang: targetLangSelect.value });
+    saveTranslationSetting('target_lang', targetLangSelect.value);
 });
 
 // ========== 翻译模式 + 网站偏好 ==========
@@ -120,6 +146,12 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
 
         // 询问 content script 当前页是否敏感站（失败静默忽略，如系统页面）
         if (tabs[0].id) {
+            activeTabId = tabs[0].id;
+            chrome.tabs.sendMessage(activeTabId, { type: 'GET_TRANSLATION_STATUS' }, (resp) => {
+                if (chrome.runtime.lastError || !resp) return;
+                if (resp.running) document.getElementById('status').textContent = '翻译中，请稍候…';
+                else if (resp.outcome) showTranslationOutcome(resp.outcome);
+            });
             chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_SITE_STATUS' }, (resp) => {
                 if (chrome.runtime.lastError || !resp) return;
                 if (resp.sensitive) {
@@ -176,13 +208,13 @@ sitePrefAutoBtn.addEventListener('click', () => saveSitePreference('auto'));
 sitePrefNeverBtn.addEventListener('click', () => saveSitePreference('never'));
 sitePrefClearBtn.addEventListener('click', () => saveSitePreference(null));
 
-// 双语对照开关（改动只在下次翻译时生效，明示用户）
+// content 监听设置变化，只重绘已有译文，不重新请求翻译。
 bilingualToggle.addEventListener('change', () => {
-    chrome.storage.local.set({ bilingual_mode: bilingualToggle.checked });
-    const statusDiv = document.getElementById('status');
-    statusDiv.textContent = '已保存，重新翻译后生效';
-    statusDiv.style.color = '#5f6368';
-    setTimeout(() => { statusDiv.textContent = '准备就绪'; }, 3000);
+    chrome.storage.local.set({ bilingual_mode: bilingualToggle.checked }, () => {
+        const statusDiv = document.getElementById('status');
+        statusDiv.textContent = chrome.runtime.lastError ? '设置保存失败，请重试' : '双语显示已切换，无需重新翻译';
+        statusDiv.style.color = chrome.runtime.lastError ? '#d93025' : '#5f6368';
+    });
 });
 
 // 划词翻译开关（content script 监听 onChanged，即时生效）
@@ -465,7 +497,7 @@ chrome.storage.local.get(['translate_engine'], (result) => {
 // 切换引擎
 engineSelect.addEventListener('change', () => {
   const engine = engineSelect.value;
-  chrome.storage.local.set({ translate_engine: engine });
+  saveTranslationSetting('translate_engine', engine);
   updateApiKeyPanel(engine);
 });
 
@@ -501,16 +533,9 @@ apiKeySaveBtn.addEventListener('click', () => {
 
 // ========== 翻译完成消息监听 ==========
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.type === 'TRANSLATION_DONE') {
-        const statusDiv = document.getElementById('status');
-        if (statusDiv) {
-            statusDiv.textContent = "翻译完成";
-            statusDiv.style.color = "#188038";
-            setTimeout(() => {
-                statusDiv.textContent = "准备就绪";
-                statusDiv.style.color = "#5f6368";
-            }, 3000);
-        }
+    if (request.type === 'TRANSLATION_DONE' && sender.tab?.id === activeTabId) {
+        if (request.targetLang && (request.targetLang !== targetLangSelect.value || request.engine !== engineSelect.value)) return;
+        showTranslationOutcome(request);
         updateCacheSize();
         updateStats();
     }

@@ -63,7 +63,7 @@ Visit the Chrome Web Store link (link to be added) and click "Add to Chrome".
 ├── content.js          # Content Script：DOM 遍历、内存缓存、UI 交互
 ├── popup.html / .js    # 弹窗 UI：引擎切换、API Key、翻译模式、网站偏好
 ├── icons/              # 应用图标
-├── tests/run-tests.js  # 纯函数单测（Node.js 跑）
+├── tests/             # 纯函数与翻译链路边界回归（Node.js 跑）
 ├── CLAUDE.md           # Claude Code 用项目说明
 ├── AGENTS.md           # Codex CLI 用项目说明（与 CLAUDE.md 同步）
 └── PRIVACY_POLICY.md   # 双语隐私政策
@@ -84,7 +84,7 @@ Visit the Chrome Web Store link (link to be added) and click "Add to Chrome".
 ## 🧪 Development
 
 ```bash
-# 跑测试（仅覆盖纯函数）
+# 跑测试（纯函数与模拟浏览器边界回归，不能代替实际扩展验收）
 node tests/run-tests.js
 
 # 加载扩展：chrome://extensions/ → 开发者模式 → 加载未打包 → 选择本目录
@@ -95,7 +95,14 @@ node tests/run-tests.js
 
 ## 📝 Changelog
 
-### v1.5.4 (current)
+### v1.5.5
+- 翻译结果区分完成、部分完成和失败；支持重试未完成内容、忽略缓存重新翻译
+- 缓存按语言和引擎隔离，失败结果及跨引擎降级结果不写入该引擎缓存
+- 长段落分片后完整回写，保留原有请求与速率限额；过长内容明确提示
+- 双语开关立即重绘已有译文，不重复请求；语言/引擎切换时作废旧结果
+- 划词译文可复制，气泡支持关闭、Esc 和内部滚动
+
+### v1.5.4
 - 安全：划词只接受真实用户事件；动态网页翻译增加每分钟字符预算，阻止恶意页面持续刷付费 API
 - 安全：background 校验 content sender、单条 1500 字、单批 200 条 / 20000 字及每标签页请求预算
 - 隐私：新安装默认手动翻译；旧版明确开启自动翻译的用户升级后保留原偏好

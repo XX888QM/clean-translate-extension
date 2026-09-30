@@ -323,8 +323,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (!consumeTranslationRequestBudget(tabId, validated.totalChars)) {
           throw new Error('translation rate limit exceeded');
         }
-        const results = await handleBatchTranslation(validated.texts);
-        sendResponse({ success: true, results });
+        const outcome = await handleBatchTranslation(validated.texts, request);
+        sendResponse({ success: Object.keys(outcome.results).length > 0, ...outcome });
       } catch (error) {
         console.error("批量翻译失败:", error);
         sendResponse({ success: false, error: error.message });
@@ -396,7 +396,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (engine === 'google_free') {
           // 当前引擎是 google_free，只返回一个结果
           const r = await translateBulk([text], targetLang, controller.signal);
-          results.primary = { engine: ENGINE_NAMES.google_free, text: r[text] || text };
+          results.primary = { engine: ENGINE_NAMES.google_free, text: r[text],
+            error: typeof r[text] === 'string' ? null : '未取得译文，请重试' };
         } else {
           // 并行调用：当前引擎 + google_free
           const [primaryResult, googleResult] = await Promise.allSettled([
@@ -406,13 +407,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           results.primary = {
             engine: ENGINE_NAMES[engine] || engine,
-            text: primaryResult.status === 'fulfilled' ? (primaryResult.value[text] || text) : text,
-            error: primaryResult.status === 'rejected' ? primaryResult.reason.message : null
+            text: primaryResult.status === 'fulfilled' ? primaryResult.value[text] : undefined,
+            error: primaryResult.status === 'fulfilled' && typeof primaryResult.value[text] === 'string'
+              ? null : '未取得译文，请重试'
           };
           results.secondary = {
             engine: ENGINE_NAMES.google_free,
-            text: googleResult.status === 'fulfilled' ? (googleResult.value[text] || text) : text,
-            error: googleResult.status === 'rejected' ? googleResult.reason.message : null
+            text: googleResult.status === 'fulfilled' ? googleResult.value[text] : undefined,
+            error: googleResult.status === 'fulfilled' && typeof googleResult.value[text] === 'string'
+              ? null : '未取得译文，请重试'
           };
         }
 
@@ -458,8 +461,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // 翻译完成，更新图标状态
   if (request.type === 'TRANSLATION_DONE' && sender.tab) {
-    chrome.action.setBadgeText({ text: '✓', tabId: sender.tab.id });
-    chrome.action.setBadgeBackgroundColor({ color: '#188038', tabId: sender.tab.id });
+    const failed = request.failed > 0;
+    chrome.action.setBadgeText({ text: failed ? '!' : '✓', tabId: sender.tab.id });
+    chrome.action.setBadgeBackgroundColor({ color: failed ? '#d93025' : '#188038', tabId: sender.tab.id });
 
     // 3秒后清除 badge
     setTimeout(() => {
@@ -560,11 +564,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 });
 
-async function handleBatchTranslation(texts) {
+async function handleBatchTranslation(texts, context) {
   activeTranslations++;
   startKeepAlive();
   try {
-    return await _handleBatchTranslation(texts);
+    return await _handleBatchTranslation(texts, context);
   } finally {
     activeTranslations--;
     if (activeTranslations <= 0) {
@@ -645,7 +649,7 @@ function normalizeEngine(raw) {
   return ALLOWED_ENGINES.has(raw) ? raw : 'google_free';
 }
 
-async function _handleBatchTranslation(texts) {
+async function _handleBatchTranslation(texts, context = {}) {
   texts = validateTranslationTexts(texts).texts;
   // 一次性读取目标语言和引擎设置
   let targetLang = 'zh-CN';
@@ -657,6 +661,16 @@ async function _handleBatchTranslation(texts) {
     engine = normalizeEngine(settings.translate_engine);
     if (settings.api_keys && typeof settings.api_keys === 'object') apiKeys = settings.api_keys;
   } catch (e) { /* 使用默认值 */ }
+
+  // 每次任务固定语言和引擎，避免全局设置在分批请求之间变化。
+  if (context.targetLang !== undefined) {
+    if (!ALLOWED_TARGET_LANGS.has(context.targetLang)) throw new Error('invalid target language');
+    targetLang = context.targetLang;
+  }
+  if (context.engine !== undefined) {
+    if (!ALLOWED_ENGINES.has(context.engine)) throw new Error('invalid translation engine');
+    engine = context.engine;
+  }
 
   // 将文本按字符总量分组，每组合并为一次 API 请求
   const MAX_BULK_CHARS = MAX_TRANSLATION_TEXT_CHARS; // 单次请求最大原文字符数
@@ -676,7 +690,9 @@ async function _handleBatchTranslation(texts) {
   if (currentGroup.length > 0) bulkGroups.push(currentGroup);
 
   // 并行发送合并请求（最多 8 个并发）
-  const results = {};
+  const results = Object.create(null);
+  const cacheableResults = Object.create(null);
+  let fallbackUsed = false;
   const PARALLEL = 8;
   const TRANSLATE_TIMEOUT_MS = 15000;
 
@@ -685,28 +701,34 @@ async function _handleBatchTranslation(texts) {
     const promises = batch.map(group => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), TRANSLATE_TIMEOUT_MS);
-      return translateByEngine(group, targetLang, engine, apiKeys, controller.signal)
+      let usedFallback = false;
+      return translateByEngine(group, targetLang, engine, apiKeys, controller.signal, () => {
+        usedFallback = true;
+        fallbackUsed = true;
+      })
+        .then(translations => {
+          if (!usedFallback) Object.assign(cacheableResults, translations);
+          return translations;
+        })
         .catch(e => {
-          // 超时或全部失败：返回原文 fallback（abort 会自动取消正在跑的 fetch）
+          // 失败项不伪造译文，content 根据缺项提示失败，也不会缓存。
           if (e?.name !== 'AbortError') {
-            console.warn('YX翻译: 翻译组失败，使用原文 fallback', e.message);
+            console.warn('YX翻译: 翻译组失败', e.message);
           } else {
-            console.warn('YX翻译: 翻译组超时（>15s），已 abort 并返回原文');
+            console.warn('YX翻译: 翻译组超时（>15s），已 abort');
           }
-          const fallback = {};
-          group.forEach(t => fallback[t] = t);
-          return fallback;
+          return {};
         })
         .finally(() => clearTimeout(timeoutId));
     });
     const batchResults = await Promise.all(promises);
     batchResults.forEach(r => Object.assign(results, r));
   }
-  return results;
+  return { results, cacheableResults, fallbackUsed, targetLang, engine };
 }
 
 // 根据引擎选择路由到不同翻译函数
-async function translateByEngine(texts, targetLang, engine, apiKeys, signal) {
+async function translateByEngine(texts, targetLang, engine, apiKeys, signal, onFallback = () => {}) {
   try {
     switch (engine) {
       case 'google_cloud':
@@ -731,12 +753,10 @@ async function translateByEngine(texts, targetLang, engine, apiKeys, signal) {
     console.warn(`YX翻译: ${engine} 引擎翻译失败，回退到免费Google翻译`, e.message);
     // 非google_free引擎失败时回退到免费Google翻译
     if (engine !== 'google_free') {
+      onFallback();
       return await translateBulk(texts, targetLang, signal);
     }
-    // google_free本身失败，返回原文
-    const fallback = {};
-    texts.forEach(t => fallback[t] = t);
-    return fallback;
+    throw e;
   }
 }
 
@@ -785,10 +805,11 @@ async function translateBulk(texts, targetLang, signal) {
       const results = {};
       for (let i = 0; i < uniqueTexts.length; i++) {
         let t = translated[i];
+        if (typeof t !== 'string' || !t.trim()) continue;
         if (targetLang.startsWith('zh')) {
           t = await refineTranslation(uniqueTexts[i], t);
         }
-        results[uniqueTexts[i]] = t || uniqueTexts[i];
+        results[uniqueTexts[i]] = t;
       }
       return results;
     }
@@ -810,21 +831,30 @@ async function translateBulkFallback(texts, targetLang, signal) {
     translateSingle(text, 0, targetLang, signal)
       .catch(e => {
         if (signal?.aborted || e?.name === 'AbortError') throw e;
-        return { original: text, translated: text };
+        return null;
       })
   );
   const individual = await Promise.all(promises);
   individual.forEach(r => {
-    results[r.original] = r.translated;
+    if (r) results[r.original] = r.translated;
   });
   return results;
 }
 
 // ========== Google Cloud Translation API v2 ==========
+// 只收录供应商确实返回的非空译文；缺项留给上层标记失败。
+async function mapTranslationResults(texts, translations, targetLang) {
+  const entries = await Promise.all(texts.map(async (source, i) => {
+    const translated = translations[i];
+    if (typeof translated !== 'string' || !translated.trim()) return null;
+    return [source, targetLang.startsWith('zh') ? await refineTranslation(source, translated) : translated];
+  }));
+  return Object.fromEntries(entries.filter(Boolean));
+}
+
 async function translateGoogleCloud(texts, targetLang, apiKey, signal) {
   if (!apiKey) throw new Error('Google Cloud API密钥未配置');
 
-  const results = {};
   // Google Cloud API 支持批量翻译，直接发送数组
   const url = `https://translation.googleapis.com/language/translate/v2?key=${encodeURIComponent(apiKey)}`;
   const response = await fetch(url, {
@@ -846,19 +876,7 @@ async function translateGoogleCloud(texts, targetLang, apiKey, signal) {
   const data = await response.json();
   const translations = data.data?.translations || [];
 
-  if (targetLang.startsWith('zh')) {
-    // 中文：并行做术语校对（buildCompiledGlossary 内部已缓存）
-    const refined = await Promise.all(texts.map((src, i) => {
-      const raw = translations[i]?.translatedText || src;
-      return refineTranslation(src, raw);
-    }));
-    for (let i = 0; i < texts.length; i++) results[texts[i]] = refined[i];
-  } else {
-    for (let i = 0; i < texts.length; i++) {
-      results[texts[i]] = translations[i]?.translatedText || texts[i];
-    }
-  }
-  return results;
+  return mapTranslationResults(texts, translations.map(t => t?.translatedText), targetLang);
 }
 
 // ========== DeepL API ==========
@@ -895,22 +913,8 @@ async function translateDeepL(texts, targetLang, apiKey, signal) {
   }
 
   const data = await response.json();
-  const results = {};
   const translations = data.translations || [];
-
-  if (targetLang.startsWith('zh')) {
-    // 中文：并行做术语校对
-    const refined = await Promise.all(texts.map((src, i) => {
-      const raw = translations[i]?.text || src;
-      return refineTranslation(src, raw);
-    }));
-    for (let i = 0; i < texts.length; i++) results[texts[i]] = refined[i];
-  } else {
-    for (let i = 0; i < texts.length; i++) {
-      results[texts[i]] = translations[i]?.text || texts[i];
-    }
-  }
-  return results;
+  return mapTranslationResults(texts, translations.map(t => t?.text), targetLang);
 }
 
 // ========== 百度翻译 API ==========
@@ -1111,41 +1115,19 @@ async function translateBaidu(texts, targetLang, appId, key, signal) {
   if (!response.ok) throw new Error(`百度翻译 HTTP ${response.status}`);
 
   const data = await response.json();
-  if (data.error_code) throw new Error(`百度翻译错误 ${data.error_code}: ${data.error_msg}`);
+  if (data.error_code) throw new Error('百度翻译服务返回错误');
 
-  const results = {};
   const transResult = data.trans_result || [];
 
   // 百度翻译返回 src/dst 对，按 \n 分隔的文本会返回多条结果
   if (transResult.length === texts.length) {
-    if (targetLang.startsWith('zh')) {
-      const refined = await Promise.all(texts.map((src, i) => {
-        const raw = transResult[i]?.dst || src;
-        return refineTranslation(src, raw);
-      }));
-      for (let i = 0; i < texts.length; i++) results[texts[i]] = refined[i];
-    } else {
-      for (let i = 0; i < texts.length; i++) {
-        results[texts[i]] = transResult[i]?.dst || texts[i];
-      }
-    }
+    return mapTranslationResults(texts, transResult.map(t => t?.dst), targetLang);
   } else {
     // 行数不匹配时尝试按原文匹配
     const dstMap = new Map();
     transResult.forEach(r => dstMap.set(r.src, r.dst));
-    if (targetLang.startsWith('zh')) {
-      const refined = await Promise.all(texts.map(text => {
-        const raw = dstMap.get(text) || text;
-        return raw === text ? Promise.resolve(text) : refineTranslation(text, raw);
-      }));
-      for (let i = 0; i < texts.length; i++) results[texts[i]] = refined[i];
-    } else {
-      for (const text of texts) {
-        results[text] = dstMap.get(text) || text;
-      }
-    }
+    return mapTranslationResults(texts, texts.map(text => dstMap.get(text)), targetLang);
   }
-  return results;
 }
 
 // ========== LLM 统一翻译接口（OpenAI / Claude / DeepSeek） ==========
@@ -1154,7 +1136,7 @@ function buildNumberedPrompt(texts) {
   return texts.map((t, i) => `[${i + 1}] ${t}`).join('\n');
 }
 
-// 解析 LLM 编号回包：按行匹配 [n] 译文，越界/缺号忽略，未命中保留原文。纯函数，便于测试。
+// 解析 LLM 编号回包：按行匹配 [n] 译文，越界/缺号忽略，缺项不冒充成功。
 function parseLLMReply(replyText, texts) {
   const results = {};
   const lines = (replyText || '').split('\n').filter(l => l.trim());
@@ -1166,10 +1148,6 @@ function parseLLMReply(replyText, texts) {
         results[texts[idx]] = match[2].trim();
       }
     }
-  }
-  // 未匹配到的文本保留原文
-  for (const text of texts) {
-    if (!results[text]) results[text] = text;
   }
   return results;
 }
@@ -2160,7 +2138,7 @@ async function translateFallback(text, targetLang = 'zh-CN', signal) {
     const response = await fetch(url, { signal });
     if (!response.ok) throw new Error(`MyMemory HTTP ${response.status}`);
     const data = await response.json();
-    if (data && data.responseData && data.responseData.translatedText) {
+    if (Number(data?.responseStatus) === 200 && typeof data.responseData?.translatedText === 'string' && data.responseData.translatedText.trim()) {
       return data.responseData.translatedText;
     }
     return null;
@@ -2212,7 +2190,7 @@ async function translateSingle(text, retryCount = 0, targetLang = 'zh-CN', signa
         return { original: text, translated: translatedText };
       }
     }
-    return { original: text, translated: text };
+    throw new Error('Google 未返回有效译文');
   } catch (error) {
     if (signal?.aborted || error?.name === 'AbortError') throw error;
     console.warn(`YX翻译: Google 翻译失败 - ${error.message}，尝试备选翻译源...`);
@@ -2225,7 +2203,7 @@ async function translateSingle(text, retryCount = 0, targetLang = 'zh-CN', signa
       }
       return { original: text, translated: result };
     }
-    return { original: text, translated: text };
+    throw new Error('翻译服务暂不可用，请稍后重试');
   }
 }
 
